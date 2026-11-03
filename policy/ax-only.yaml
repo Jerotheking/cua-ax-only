@@ -38,6 +38,13 @@ allow:
       constraints:
         element_token: {pattern: ".+"}
         delivery_mode: {allowed: ["background"]}
+    - tool: click
+      constraints:
+        pid: {min: 1}
+        window_id: {min: 1}
+        x: {min: -100000}
+        y: {min: -100000}
+        delivery_mode: {allowed: ["background"]}
     - tool: type_text
       constraints:
         element_token: {pattern: ".+"}

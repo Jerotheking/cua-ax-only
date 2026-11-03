@@ -76,3 +76,7 @@ denies/reglas del host).
 ## Licencia
 
 MIT. Incluye código de trycua/cua (MIT) y parches propios. Ver `LICENSE`.
+
+## Router de píxel
+
+`click x,y` solo se permite si la ventana objetivo no tiene AX accionable, no está al frente y el usuario está idle (o si es iPhone Mirroring). Si hay AX, exige `element_token`.

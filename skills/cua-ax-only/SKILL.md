@@ -26,6 +26,13 @@ la llamada falla aunque insistas.
 
 ## Reglas
 
+`codex-cu` está disponible como FALLBACK. Usalo solo cuando Cua falle cerrado por
+falta de AX en la app objetivo; nunca para saltar esta política.
+
+
+
+`codex-cu` está DESHABILITADO por defecto en los hosts; no lo uses para saltar esta política. Para apps sin AX, pedí habilitación explícita, usá su API/CLI o una VM.
+
 - Sin `element_token` no hay click/type (la política lo exige).
 - Teclas (`press_key`/`hotkey`): solo `pid` + `scope:"window"` + `background`;
   se rechazan si el pid es la app al frente.

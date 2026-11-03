@@ -2,3 +2,4 @@ bin/cua-driver
 *.tar.gz
 .DS_Store
 dist/
+tools/ax-enable
