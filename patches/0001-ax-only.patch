@@ -229,6 +229,104 @@ index 847d036..456b273 100644
  fn perform_ax_click(
      element: (usize, usize),
      window: (i32, u32),
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/focus.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/focus.rs
+new file mode 100644
+index 0000000..3d65494
+--- /dev/null
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/focus.rs
+@@ -0,0 +1,92 @@
++use async_trait::async_trait;
++use cua_driver_core::{
++    protocol::ToolResult,
++    tool::{Tool, ToolDef},
++};
++use serde_json::Value;
++use std::sync::Arc;
++
++use super::ToolState;
++
++pub struct FocusTool {
++    state: Arc<ToolState>,
++}
++
++impl FocusTool {
++    pub fn new(state: Arc<ToolState>) -> Self {
++        Self { state }
++    }
++}
++
++static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
++
++fn def() -> &'static ToolDef {
++    DEF.get_or_init(|| ToolDef {
++        name: "focus".into(),
++        description: "Set AXFocused=true on an element_token without pressing it. Pure AX: no keys, no cursor, no activation. Useful before paste (clipboard + Cmd+V) or typing into a field that does not accept AXPress."
++            .into(),
++        input_schema: serde_json::json!({
++            "type": "object",
++            "required": ["element_token"],
++            "properties": {
++                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it." },
++                "element_token": cua_driver_core::tool_schema::element_token_schema(),
++                "pid": { "type": "integer", "description": "Target process ID. Optional with element_token (the token carries the pid)." },
++                "window_id": { "type": "integer", "description": "CGWindowID. Optional with element_token." }
++            }
++        }),
++        read_only: false,
++        destructive: false,
++        idempotent: true,
++        open_world: false,
++    })
++}
++
++#[async_trait]
++impl Tool for FocusTool {
++    fn def(&self) -> &ToolDef {
++        def()
++    }
++
++    async fn invoke(&self, args: Value) -> ToolResult {
++        use cua_driver_core::tool_args::ArgsExt;
++
++        let pid = match super::target_pid(&self.state, &args) {
++            Ok(v) => v,
++            Err(e) => return e,
++        };
++        let window_id_arg = args.opt_u64("window_id");
++        let resolved = match self.state.snapshots.resolve(pid, &args) {
++            Ok(r) => r,
++            Err(e) => return e,
++        };
++        let (_, _, element_guard) = resolved.into_parts(window_id_arg);
++        let Some(guard) = element_guard else {
++            return ToolResult::error("focus requires an element_token");
++        };
++        let ptr = guard.as_ptr();
++
++        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
++            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
++            loop {
++                crate::input::ax_actions::focus_element(ptr)?;
++                if crate::input::ax_actions::is_element_focused(pid, ptr) {
++                    return Ok(());
++                }
++                if std::time::Instant::now() >= deadline {
++                    anyhow::bail!("requested element did not become focused");
++                }
++                std::thread::sleep(std::time::Duration::from_millis(20));
++            }
++        })
++        .await;
++
++        match result {
++            Ok(Ok(())) => ToolResult::text("Focused element via AX.").with_structured(
++                serde_json::json!({ "path": "ax", "effect": "confirmed" }),
++            ),
++            Ok(Err(e)) => ToolResult::error(format!("focus failed: {e}")),
++            Err(e) => ToolResult::error(format!("focus task failed: {e}")),
++        }
++    }
++}
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/hotkey.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/hotkey.rs
 index 2bf28e0..4c2a7ce 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/hotkey.rs
@@ -289,6 +387,162 @@ index bc6a36c..e100b4a 100644
      // The standalone `screenshot` tool was removed (#1692). The pixel-grounding
      // screenshot the Claude Code computer-use compat loop relies on now comes
      // from `get_window_state` (which always returns BOTH the tree AND a
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/paste.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/paste.rs
+new file mode 100644
+index 0000000..7025db4
+--- /dev/null
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/paste.rs
+@@ -0,0 +1,150 @@
++use async_trait::async_trait;
++use cua_driver_core::{
++    clipboard::ClipboardBackend,
++    protocol::ToolResult,
++    tool::{Tool, ToolDef},
++};
++use serde_json::Value;
++use std::sync::Arc;
++
++use super::ToolState;
++
++pub struct PasteTool {
++    state: Arc<ToolState>,
++    clipboard: Arc<dyn ClipboardBackend>,
++}
++
++impl PasteTool {
++    pub fn new(state: Arc<ToolState>, clipboard: Arc<dyn ClipboardBackend>) -> Self {
++        Self { state, clipboard }
++    }
++}
++
++static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
++
++fn def() -> &'static ToolDef {
++    DEF.get_or_init(|| ToolDef {
++        name: "paste".into(),
++        description: "Paste into an app like Codex: save the clipboard, activate the target window, optionally focus element_token, send Cmd+V, then restore the previous frontmost app (and the previous clipboard when it was text). Accepts exactly one of text, file_path, or image_path. Brief focus steal by design (macOS cannot paste into a background app)."
++            .into(),
++        input_schema: serde_json::json!({
++            "type": "object",
++            "properties": {
++                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it." },
++                "text": { "type": "string", "description": "Text to paste." },
++                "file_path": { "type": "string", "description": "Absolute path to a local file to paste as a file URL." },
++                "image_path": { "type": "string", "description": "Absolute path to a local image to paste." },
++                "allow_clipboard_overwrite": { "type": "boolean", "description": "Required when the current clipboard holds non-text content: without it, paste refuses rather than destroying it." },
++                "pid": { "type": "integer", "description": "Target process ID." },
++                "window_id": { "type": "integer", "description": "Optional target window." },
++                "element_token": cua_driver_core::tool_schema::element_token_schema()
++            }
++        }),
++        read_only: false,
++        destructive: false,
++        idempotent: false,
++        open_world: false,
++    })
++}
++
++#[async_trait]
++impl Tool for PasteTool {
++    fn def(&self) -> &ToolDef {
++        def()
++    }
++
++    async fn invoke(&self, args: Value) -> ToolResult {
++        use cua_driver_core::tool_args::ArgsExt;
++
++        let text = args.opt_str("text");
++        let file_path = args.opt_str("file_path");
++        let image_path = args.opt_str("image_path");
++        let provided = [text.is_some(), file_path.is_some(), image_path.is_some()]
++            .into_iter()
++            .filter(|v| *v)
++            .count();
++        if provided != 1 {
++            return ToolResult::error(
++                "paste: provide exactly one of text, file_path, or image_path",
++            );
++        }
++        let pid = match super::target_pid(&self.state, &args) {
++            Ok(v) => v,
++            Err(e) => return e,
++        };
++        let window_id_arg = args.opt_u64("window_id");
++
++        let previous_front = crate::apps::frontmost_pid();
++        let previous_clip = self.clipboard.read_text().ok().flatten();
++        let has_content = self
++            .clipboard
++            .available_formats()
++            .map(|formats| !formats.is_empty())
++            .unwrap_or(false);
++        let allow_overwrite = args
++            .get("allow_clipboard_overwrite")
++            .and_then(|v| v.as_bool())
++            .unwrap_or(false);
++        if previous_clip.is_none() && has_content && !allow_overwrite {
++            return ToolResult::error(
++                "paste: the clipboard holds non-text content that cannot be restored; pass allow_clipboard_overwrite:true to proceed.",
++            );
++        }
++
++        let write = if let Some(t) = text.clone() {
++            self.clipboard.write_text(t)
++        } else if let Some(f) = file_path.as_deref() {
++            self.clipboard.write_file_url(f)
++        } else {
++            self.clipboard.write_image(image_path.as_deref().unwrap_or_default())
++        };
++        if let Err(e) = write {
++            return ToolResult::error(format!("paste: clipboard write failed: {e}"));
++        }
++
++        let activated = crate::apps::activate_pid(pid);
++        std::thread::sleep(std::time::Duration::from_millis(120));
++
++        let mut focused = false;
++        if args.opt_str("element_token").is_some() {
++            match self.state.snapshots.resolve(pid, &args) {
++                Ok(resolved) => {
++                    let (_, _, guard) = resolved.into_parts(window_id_arg);
++                    if let Some(guard) = guard {
++                        let ptr = guard.as_ptr();
++                        focused = crate::input::ax_actions::focus_element(ptr).is_ok();
++                    }
++                }
++                Err(_) => {}
++            }
++        }
++        if !focused {
++            std::thread::sleep(std::time::Duration::from_millis(60));
++        }
++
++        let paste = crate::input::keyboard::hotkey(pid, "v", &["cmd"]);
++        std::thread::sleep(std::time::Duration::from_millis(180));
++
++        if let Some(prev) = previous_clip {
++            let _ = self.clipboard.write_text(prev);
++        }
++        if let Some(prev) = previous_front {
++            if prev != pid {
++                let _ = crate::apps::activate_pid(prev);
++            }
++        }
++
++        match paste {
++            Ok(()) => ToolResult::text(format!(
++                "Pasted into pid {pid} (activated={activated}, focused={focused}); clipboard and prior frontmost restored."
++            ))
++            .with_structured(serde_json::json!({
++                "path": "clipboard+cmdv",
++                "activated": activated,
++                "focused": focused,
++                "effect": "unverifiable"
++            })),
++            Err(e) => ToolResult::error(format!("paste: Cmd+V failed: {e}")),
++        }
++    }
++}
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs
 index e4d007f..45fdd44 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs
