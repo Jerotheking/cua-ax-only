@@ -4,7 +4,7 @@ deny:
           page, start_recording, install_extension, install_ffmpeg, escalate_session,
           clipboard_read]
 allow:
-  tools: [run_steps, focus, clipboard_write, get_window_state, get_accessibility_tree, get_screen_size, get_desktop_state,
+  tools: [run_steps, paste, focus, clipboard_write, get_window_state, get_accessibility_tree, get_screen_size, get_desktop_state,
           get_cursor_position, list_apps, list_windows, list_sessions, get_session,
           get_session_state, get_config, get_browser_state, get_guide, get_agent_cursor_state,
           get_recording_state, verify_state, zoom, parse_visual_regions, check_permissions,
@@ -34,6 +34,11 @@ allow:
     - tool: move_cursor
       constraints:
         scope: {allowed: ["window"]}
+    - tool: drag
+      constraints:
+        pid: {min: 1}
+        window_id: {min: 1}
+        delivery_mode: {allowed: ["foreground"]}
     - tool: drag
       constraints:
         pid: {min: 1}

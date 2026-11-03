@@ -26,7 +26,7 @@ la llamada falla aunque insistas.
 
 ## Reglas
 
-Paste nativo: `paste` (text, pid, element_token opcional) activa, pega con Cmd+V y restaura clipboard/frontmost. Para texto simple preferí `set_value`/`type_text`.
+Paste nativo: `paste` acepta text, file_path o image_path; activa, pega con Cmd+V y restaura clipboard/frontmost. Drag de archivos: background falla, reintentá foreground.
 
 
 `codex-cu` es el fallback universal. Si Cua falla cerrado (sin AX, `suspected_noop`,
