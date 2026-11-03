@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cua-driver": {
+      "command": "<HOME>/Applications/CuaDriverFork.app/Contents/MacOS/cua-driver",
+      "args": ["mcp", "--direct"],
+      "env": {
+        "CUA_DRIVER_AX_ONLY": "1",
+        "CUA_DRIVER_POLICY_FILE": "<HOME>/.cua-driver/ax-only.yaml"
+      }
+    }
+  }
+}

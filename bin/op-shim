@@ -1,0 +1,14 @@
+#!/bin/bash
+# Shim: bloquea lecturas de secretos salvo que vengan del inyector (OP_INJECT=1).
+REAL="/opt/homebrew/bin/op"
+case "${1:-}" in
+  read) blocked=1 ;;
+  item) [ "${2:-}" = "get" ] && blocked=1 ;;
+  document) [ "${2:-}" = "get" ] && blocked=1 ;;
+  *) blocked=0 ;;
+esac
+if [ "$blocked" = "1" ] && [ "${OP_INJECT:-}" != "1" ]; then
+  echo "op: lectura de secretos bloqueada. Usá ~/.local/bin/op-inject.py (o OP_INJECT=1 op ... si sos el humano)." >&2
+  exit 1
+fi
+exec "$REAL" "$@"
