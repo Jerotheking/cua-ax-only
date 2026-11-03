@@ -1,3 +1,16 @@
+diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
+index 8e4ed0d..2446a8e 100644
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
+@@ -894,6 +894,8 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
+         | "press_key"
+         | "hotkey"
+         | "set_value"
++        | "focus"
++        | "paste"
+         | "run_steps"
+         | "run_script"
+         | "invoke_menu"
 diff --git a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs b/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
 index 02b4498..2b271ac 100644
 --- a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
@@ -234,6 +247,48 @@ index 2bf28e0..4c2a7ce 100644
  
          if args.get("keys").and_then(|v| v.as_array()).is_none() {
              return ToolResult::error("Missing required parameter: keys");
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+index bc6a36c..e100b4a 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+@@ -5,6 +5,8 @@ mod capture_binding;
+ mod click;
+ mod clipboard;
+ mod double_click;
++mod focus;
++mod paste;
+ mod drag;
+ mod get_window_state;
+ mod hotkey;
+@@ -1127,6 +1129,10 @@ pub fn register_all(
+         right_click::RightClickTool::new(state.clone()),
+         &pid_window_candidates,
+     ));
++    registry.register(pid_window_guarded(
++        focus::FocusTool::new(state.clone()),
++        &pid_window_candidates,
++    ));
+     registry.register(pid_window_guarded(
+         drag::DragTool::new(state.clone()),
+         &pid_window_candidates,
+@@ -1151,10 +1157,13 @@ pub fn register_all(
+         scroll::ScrollTool::new(state.clone()),
+         &pid_window_candidates,
+     ));
+-    cua_driver_core::clipboard::register_clipboard_tools(
+-        registry,
+-        Arc::new(clipboard::MacosClipboard::new()),
+-    );
++    let clipboard_backend: Arc<dyn cua_driver_core::clipboard::ClipboardBackend> =
++        Arc::new(clipboard::MacosClipboard::new());
++    cua_driver_core::clipboard::register_clipboard_tools(registry, clipboard_backend.clone());
++    registry.register(Box::new(paste::PasteTool::new(
++        state.clone(),
++        clipboard_backend,
++    )));
+     // The standalone `screenshot` tool was removed (#1692). The pixel-grounding
+     // screenshot the Claude Code computer-use compat loop relies on now comes
+     // from `get_window_state` (which always returns BOTH the tree AND a
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs
 index e4d007f..45fdd44 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs

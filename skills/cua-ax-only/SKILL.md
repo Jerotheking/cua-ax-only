@@ -26,8 +26,13 @@ la llamada falla aunque insistas.
 
 ## Reglas
 
-`codex-cu` está disponible como FALLBACK. Usalo solo cuando Cua falle cerrado por
-falta de AX en la app objetivo; nunca para saltar esta política.
+Paste nativo: `paste` (text, pid, element_token opcional) activa, pega con Cmd+V y restaura clipboard/frontmost. Para texto simple preferí `set_value`/`type_text`.
+
+
+`codex-cu` es el fallback universal. Si Cua falla cerrado (sin AX, `suspected_noop`,
+`element_token` no settable) o necesitás drag / doble clic / paste / píxel con el
+usuario activo, usá `codex-cu` para ESA acción. En `codex-cu` preferí índice/AX
+sobre coordenadas y evitá la ventana al frente. Volvé a Cua para leer/verificar.
 
 
 

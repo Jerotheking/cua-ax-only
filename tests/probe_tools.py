@@ -10,7 +10,7 @@ import time
 C = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else
                        "~/Applications/CuaDriverFork.app/Contents/MacOS/cua-driver")
 POLICY = os.path.expanduser("~/.cua-driver/ax-only.yaml")
-EXPECT_COUNT = int(os.environ.get("EXPECT_COUNT", "48"))
+EXPECT_COUNT = int(os.environ.get("EXPECT_COUNT", "53"))
 
 env = dict(os.environ)
 env["CUA_DRIVER_AX_ONLY"] = "1"
@@ -71,7 +71,10 @@ r = wait(2) or {}
 names = sorted(t["name"] for t in (r.get("result") or {}).get("tools", []))
 check(len(names) == EXPECT_COUNT, f"tools/list = {len(names)} (esperado {EXPECT_COUNT})")
 check("run_script" not in names, "run_script oculta")
-check("drag" not in names, "drag oculta")
+check("drag" in names, "drag visible")
+check("double_click" in names, "double_click visible")
+check("focus" in names, "focus visible")
+check("paste" in names, "paste visible")
 check("press_key" in names, "press_key visible")
 check("scroll" in names, "scroll visible")
 
