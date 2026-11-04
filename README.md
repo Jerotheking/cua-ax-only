@@ -12,7 +12,7 @@ bin/cua-driver        binario prebuilt (arm64)
 bin/op-inject.py      inyector de 1Password (lee y escribe por AX, no imprime)
 bin/op-shim           shim de op (bloquea read/get salvo OP_INJECT=1)
 policy/ax-only.yaml   política server-side (default-deny)
-patches/              parche fuente (7 archivos)
+patches/              parches fuente AX-only + cierre por inactividad
 scripts/install.sh    instalador
 scripts/update.sh     rebuild desde upstream + parches + deploy + smoke
 tests/                smoke (48 tools, denegaciones, click AX)
@@ -23,14 +23,15 @@ examples/             snippets de MCP por host
 ## Instalar
 
 ```sh
-tar xzf cua-ax-only-20261102.tar.gz
-cd cua-ax-only-20261102
+tar xzf cua-ax-only-20261103.8.tar.gz
+cd cua-ax-only-20261103.8
 ./scripts/install.sh
 ```
 
-El instalador es **no destructivo**: si ya existe una app o política distinta,
-no la pisa (sale con error o la conserva). Para reemplazar de verdad:
-`./scripts/install.sh --force` (hace backup `.bak-<ts>`).
+El instalador verifica la revisión de `VERSION` y el hash del binario firmado. Si encuentra
+una instalación sin sello de revisión o con otra revisión, se detiene. Para reemplazarla:
+`./scripts/install.sh --force` (hace backup y reemplaza aunque ambos binarios digan `0.38.0`).
+La política existente se conserva salvo que `--force` y la copia del paquete permitan actualizarla.
 
 Luego:
 1. Ajustes → Privacidad y Seguridad → **Accesibilidad** y **Grabación de pantalla** para `CuaDriverFork.app` (o para el host si usás `--direct`).
@@ -59,8 +60,27 @@ REF=main ./scripts/update.sh          # clona upstream, aplica parches, build, d
 REF=main ./scripts/update.sh --dry-run
 ```
 
-Si un parche no aplica, aborta: hay que rebasarlo y regenerar
-`patches/0001-ax-only.patch`. Nunca hereda cambios no revisados.
+Si un parche no aplica, aborta: hay que rebasarlo y regenerar la serie numerada. Nunca hereda cambios no revisados.
+
+`patches/0001-idle-shutdown.patch` añade un endpoint MCP supervisor liviano. En `mcp --direct`, el
+worker SDK pesado nace al primer `tools/call`, se cierra tras **4 horas sin llamadas reales** y se
+vuelve a crear ante la siguiente llamada dentro de la misma sesión del host. `initialize`, `tools/list`,
+`ping`, sockets y sesiones CUA persistentes no cuentan como uso. Una llamada activa está protegida del
+TTL de inactividad. `CUA_DRIVER_IDLE_SHUTDOWN_SECONDS` permite cambiar el plazo; `0` desactiva el autoapagado.
+La versión JSON-RPC y el ID válido se verifican antes de clasificar solicitudes legacy; IDs inválidos no
+pueden arrancar ni renovar el tiempo de vida del worker.
+Si el worker pierde el canal de control, el supervisor lo recoge y conserva el MCP liviano; la próxima
+llamada que requiera el runtime inicia un worker nuevo. Una llamada interrumpida con resultado incierto
+devuelve error y nunca se repite automáticamente.
+
+En el transporte opcional de envelopes, `cancel` y `close` siguen respondiendo durante una acción.
+En la ruta normal de macOS, el supervisor liviano también permanece conectado y crea el worker que
+lanza `CuaDriver.app` por LaunchServices. El daemon standalone usa el mismo criterio de actividad real
+y se cierra después de 4 horas sin llamadas; `mcp` vuelve a levantarlo cuando llega otra herramienta.
+Los runtimes embebidos y servicios con listener HTTP conservan su ciclo de vida propio.
+
+`patches/0002-ax-only.patch` mantiene el filtro de inventario tanto en el worker como en el supervisor;
+la lista visible sigue respetando la política AX-only cuando se inicia con `CUA_DRIVER_AX_ONLY=1`.
 
 ## 1Password
 

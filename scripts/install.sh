@@ -20,25 +20,50 @@ for arg in "$@"; do
 done
 
 APP_BIN="$APP/Contents/MacOS/cua-driver"
+PACKAGE_VERSION="$(tr -d '\r\n' < "$HERE/VERSION")"
+APP_STAMP_DIR="$HOME/.local/state/cua-driver-fork"
+APP_KEY="$(printf '%s' "$APP" | shasum -a 256 | awk '{print substr($1,1,16)}')"
+APP_STAMP="$APP_STAMP_DIR/$APP_KEY.install-stamp"
+APP_CHANGED=0
+APP_BACKUP=""
+STAMP_BACKUP=""
 
 echo "1/6 app bundle"
 mkdir -p "$APP/Contents/MacOS"
 if [ -f "$APP_BIN" ]; then
-  pkgv="$("$HERE/bin/cua-driver" --version 2>/dev/null | head -1 || true)"
   appv="$("$APP_BIN" --version 2>/dev/null | head -1 || true)"
-  if [ -n "$pkgv" ] && [ "$pkgv" = "$appv" ]; then
-    echo "  ya instalada ($appv); no se toca"
-  elif [ "$FORCE" = "1" ]; then
-    cp "$APP_BIN" "$APP_BIN.bak-$(date +%s)"
+  app_hash="$(shasum -a 256 "$APP_BIN" | awk '{print $1}')"
+  stamp_version=""
+  stamp_hash=""
+  if [ -f "$APP_STAMP" ]; then
+    IFS=' ' read -r stamp_version stamp_hash < "$APP_STAMP" || true
+  fi
+  if [ "$FORCE" = "1" ]; then
+    APP_BACKUP="$APP_BIN.bak-$(date +%s)-$$"
+    cp -p "$APP_BIN" "$APP_BACKUP"
+    if [ -f "$APP_STAMP" ]; then
+      STAMP_BACKUP="$APP_STAMP.bak-$(date +%s)-$$"
+      cp -p "$APP_STAMP" "$STAMP_BACKUP"
+    fi
     install -m 755 "$HERE/bin/cua-driver" "$APP_BIN"
-    echo "  reemplazada (backup .bak)"
+    APP_CHANGED=1
+    echo "  reemplazando $appv por paquete $PACKAGE_VERSION (backup .bak)"
+  elif [ "$stamp_version" = "$PACKAGE_VERSION" ] \
+    && [ "$stamp_hash" = "$app_hash" ] && [ -f "$APP/Contents/Info.plist" ]; then
+    if ! codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
+      echo "  ERROR: la firma de $APP no verifica; usá --force para reemplazar y volver a firmar" >&2
+      exit 1
+    fi
+    echo "  ya instalada la revisión $PACKAGE_VERSION; firma y hash verificados; no se toca"
   else
-    echo "  ERROR: ya existe otra versión en $APP_BIN" >&2
-    echo "  No la piso. Usá --force (hace backup) o APP=<otra ruta>." >&2
+    echo "  ERROR: no puedo verificar que $APP_BIN corresponda al paquete $PACKAGE_VERSION" >&2
+    echo "  versión ejecutable: ${appv:-desconocida}; revisión registrada: ${stamp_version:-ninguna}" >&2
+    echo "  Usá --force para instalar esta revisión (hace backup)." >&2
     exit 1
   fi
 else
   install -m 755 "$HERE/bin/cua-driver" "$APP_BIN"
+  APP_CHANGED=1
 fi
 if [ ! -f "$APP/Contents/Info.plist" ]; then
   cat > "$APP/Contents/Info.plist" <<'PL'
@@ -55,8 +80,27 @@ if [ ! -f "$APP/Contents/Info.plist" ]; then
   <key>LSMinimumSystemVersion</key><string>13.0</string>
 </dict></plist>
 PL
+  APP_CHANGED=1
 fi
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+if [ "$APP_CHANGED" = "1" ]; then
+  if ! codesign --force --deep --sign - "$APP" >/dev/null 2>&1 \
+    || ! codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
+    echo "  ERROR: no pude firmar/verificar $APP" >&2
+    if [ -n "$APP_BACKUP" ]; then
+      cp -p "$APP_BACKUP" "$APP_BIN"
+      codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$STAMP_BACKUP" ]; then cp -p "$STAMP_BACKUP" "$APP_STAMP"; fi
+    exit 1
+  fi
+  mkdir -p "$APP_STAMP_DIR"
+  installed_hash="$(shasum -a 256 "$APP_BIN" | awk '{print $1}')"
+  stamp_tmp="$APP_STAMP.tmp.$$"
+  printf '%s %s\n' "$PACKAGE_VERSION" "$installed_hash" > "$stamp_tmp"
+  chmod 600 "$stamp_tmp"
+  mv "$stamp_tmp" "$APP_STAMP"
+  echo "  instalada y firmada (revisión $PACKAGE_VERSION)"
+fi
 
 echo "2/6 política"
 mkdir -p "$(dirname "$POLICY")"

@@ -1,0 +1,1886 @@
+diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs
+index 7b3d30db7..12acbb6d2 100644
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs
+@@ -52,6 +52,13 @@ fn valid_request_id(req: &Request) -> bool {
+ /// Classify an individual request, retaining legacy compatibility for embedders.
+ /// Stdio adapters additionally use `ProtocolSession` to reject absent metadata.
+ pub fn classify_request(req: &Request) -> Result<ProtocolEra, Response> {
++    if req.jsonrpc != "2.0" || !valid_request_id(req) {
++        return Err(Response::error(
++            Value::Null,
++            -32600,
++            "Invalid JSON-RPC request",
++        ));
++    }
+     let meta = req.params.as_ref().and_then(|params| params.get("_meta"));
+     let modern_keys_present = meta.is_some_and(|meta| {
+         meta.get(PROTOCOL_VERSION_KEY).is_some() || meta.get(CLIENT_CAPABILITIES_KEY).is_some()
+@@ -62,13 +69,6 @@ pub fn classify_request(req: &Request) -> Result<ProtocolEra, Response> {
+         }
+         return Ok(ProtocolEra::Legacy);
+     }
+-    if req.jsonrpc != "2.0" || !valid_request_id(req) {
+-        return Err(Response::error(
+-            Value::Null,
+-            -32600,
+-            "Invalid JSON-RPC request",
+-        ));
+-    }
+     if !req.params.as_ref().is_some_and(Value::is_object) {
+         return Err(invalid_params(req, "MCP params must be an object"));
+     }
+@@ -336,4 +336,28 @@ mod tests {
+         let response = serde_json::to_value(classify_request(&req).unwrap_err()).unwrap();
+         assert_eq!(response["error"]["code"], -32602);
+     }
++
++    #[test]
++    fn legacy_requests_validate_jsonrpc_version_and_id_before_classification() {
++        for id in [json!(null), json!(false), json!({}), json!([]), json!(1.5)] {
++            let req = serde_json::from_value(json!({
++                "jsonrpc": "2.0", "id": id, "method": "tools/call",
++                "params": {"name": "list_apps", "arguments": {}}
++            }))
++            .unwrap();
++            let response =
++                serde_json::to_value(ProtocolSession::default().validate(&req).unwrap_err())
++                    .unwrap();
++            assert_eq!(response["error"]["code"], -32600, "id={id}");
++            assert!(response["id"].is_null());
++        }
++
++        let req = serde_json::from_value(json!({
++            "jsonrpc": "1.0", "id": 1, "method": "ping", "params": {}
++        }))
++        .unwrap();
++        let response =
++            serde_json::to_value(ProtocolSession::default().validate(&req).unwrap_err()).unwrap();
++        assert_eq!(response["error"]["code"], -32600);
++    }
+ }
+diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs
+index 63733f895..b7bb50a66 100644
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs
+@@ -1,6 +1,6 @@
+ //! MCP JSON-RPC 2.0 protocol types.
+ 
+-use serde::{Deserialize, Serialize};
++use serde::{Deserialize, Deserializer, Serialize};
+ use serde_json::Value;
+ 
+ // ── Request ──────────────────────────────────────────────────────────────────
+@@ -11,11 +11,19 @@ pub struct Request {
+     #[allow(dead_code)]
+     pub jsonrpc: String,
+     /// Absent on notifications.
++    #[serde(default, deserialize_with = "deserialize_present_id")]
+     pub id: Option<Value>,
+     pub method: String,
+     pub params: Option<Value>,
+ }
+ 
++fn deserialize_present_id<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    Value::deserialize(deserializer).map(Some)
++}
++
+ impl Request {
+     pub fn is_notification(&self) -> bool {
+         self.id.is_none()
+@@ -609,6 +617,24 @@ mod agent_instruction_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod request_id_tests {
++    use super::Request;
++    use serde_json::json;
++
++    #[test]
++    fn only_an_absent_id_is_a_notification() {
++        let notification: Request =
++            serde_json::from_value(json!({"jsonrpc":"2.0","method":"ping"})).unwrap();
++        let null_id: Request =
++            serde_json::from_value(json!({"jsonrpc":"2.0","id":null,"method":"ping"})).unwrap();
++
++        assert!(notification.is_notification());
++        assert!(!null_id.is_notification());
++        assert_eq!(null_id.id, Some(serde_json::Value::Null));
++    }
++}
++
+ #[cfg(test)]
+ mod initialize_metadata_tests {
+     use super::*;
+diff --git a/libs/cua-driver/rust/crates/cua-driver/src/main.rs b/libs/cua-driver/rust/crates/cua-driver/src/main.rs
+index a7abdcbc4..27afccaee 100644
+--- a/libs/cua-driver/rust/crates/cua-driver/src/main.rs
++++ b/libs/cua-driver/rust/crates/cua-driver/src/main.rs
+@@ -351,6 +351,10 @@ fn build_driver_without_cursor() -> Arc<cua_driver_sdk::CuaDriver> {
+ /// sessions, while `serve`, MCP, and direct SDK creation still fail closed
+ /// before accepting desktop actions.
+ fn inspect_tools_without_runtime() -> serde_json::Value {
++    inspect_tools_without_runtime_for(false)
++}
++
++fn inspect_tools_without_runtime_for(compatibility_mode: bool) -> serde_json::Value {
+     cua_driver_sdk::CuaDriver::inspect_host_tools(cua_driver_sdk::DriverHostOptions {
+         cursor: cursor_overlay::CursorConfig {
+             enabled: false,
+@@ -358,7 +362,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
+         },
+         host_owns_permission_ux: false,
+         host_bundle_id: None,
+-        claude_code_compatibility: false,
++        claude_code_compatibility: compatibility_mode,
+         prepare_desktop_environment: false,
+         register_host_tools: Some(register_host_tools),
+         authorization_host: None,
+@@ -377,23 +381,91 @@ fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
+     // adapter repeats this check before reading stdin as defense in depth.
+     cua_driver_core::authorization::validate_startup_authorization()?;
+     cua_driver_core::policy::validate_configured_policy()?;
+-    let cursor = cursor_overlay::CursorConfig::from_args();
+-    // A plain stdio MCP process does not provide the required AppKit
+-    // main-thread host adapter. Explicit direct mode on macOS must therefore
+-    // expose facility_unavailable instead of initializing an overlay that can
+-    // report success without a usable UI owner. Private-worker and app-service
+-    // hosts keep the full facility.
+-    #[cfg(target_os = "macos")]
+-    let cursor = {
+-        let mut cursor = cursor;
+-        cursor.enabled = false;
+-        cursor
+-    };
+-    let driver = build_driver(cursor, compatibility_mode, true)?;
++    let tools_list = inspect_tools_without_runtime_for(compatibility_mode);
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .enable_all()
++        .build()?;
++
++    // The host-facing process is a small MCP endpoint. It starts a separate
++    // native worker only when a real tool or typed-envelope request arrives,
++    // then stops that child after the idle deadline.
++    let worker_mode = std::env::var_os(proxy::DIRECT_WORKER_ENV).is_some();
++    let envelope_mode = mcp_envelope::configured()?;
++    if worker_mode {
++        let factory = move || {
++            let mut cursor = cursor_overlay::CursorConfig::from_args();
++            // A plain stdio MCP process does not provide the required AppKit
++            // main-thread host adapter. Explicit direct mode on macOS must
++            // expose facility_unavailable instead of initializing an overlay.
++            #[cfg(target_os = "macos")]
++            {
++                cursor.enabled = false;
++            }
++            build_driver(cursor, compatibility_mode, true).map_err(anyhow::Error::from)
++        };
++        runtime.block_on(proxy::run_direct(factory, tools_list))
++    } else {
++        let executable = std::env::current_exe()?;
++        let arguments = std::env::args_os().skip(1).collect();
++        runtime.block_on(proxy::run_mcp_idle_supervisor(
++            executable,
++            arguments,
++            tools_list,
++            proxy::DIRECT_WORKER_ENV,
++            true,
++            envelope_mode,
++        ))
++    }
++}
++
++fn run_mcp_service_proxy(
++    socket: Option<String>,
++    compatibility_mode: bool,
++    grants: &[String],
++    startup_started: std::time::Instant,
++) -> anyhow::Result<()> {
++    let envelope_mode = mcp_envelope::configured()?;
++    if cua_driver_core::embedded_mode()
++        || std::env::var_os(proxy::SERVICE_PROXY_WORKER_ENV).is_some()
++    {
++        // Embedded hosts own the daemon and its TCC identity. Preserve the
++        // eager endpoint check so metadata-only MCP startup cannot appear
++        // healthy while its required private daemon is missing.
++        return cli::run_mcp_via_daemon_proxy(
++            socket,
++            compatibility_mode,
++            grants,
++            |daemon, success| {
++                telemetry::capture_mcp_startup_completed(
++                    "daemon_proxy",
++                    daemon.telemetry_value(),
++                    success,
++                    startup_started.elapsed(),
++                )
++            },
++        );
++    }
++
++    telemetry::capture_mcp_startup_completed(
++        "mcp_idle_supervisor",
++        "deferred_daemon_launch",
++        true,
++        startup_started.elapsed(),
++    );
++    let executable = std::env::current_exe()?;
++    let arguments = std::env::args_os().skip(1).collect();
++    let tools_list = inspect_tools_without_runtime_for(compatibility_mode);
+     let runtime = tokio::runtime::Builder::new_multi_thread()
+         .enable_all()
+         .build()?;
+-    runtime.block_on(proxy::run_direct(driver))
++    runtime.block_on(proxy::run_mcp_idle_supervisor(
++        executable,
++        arguments,
++        tools_list,
++        proxy::SERVICE_PROXY_WORKER_ENV,
++        false,
++        envelope_mode,
++    ))
+ }
+ 
+ fn history_admission_requested(explicit: bool, persisted: bool) -> bool {
+@@ -896,19 +968,9 @@ fn main() {
+                     }
+                 }
+                 Err(error) => Err(error),
+-                Ok(false) => cli::run_mcp_via_daemon_proxy(
+-                    socket,
+-                    claude_code_compat,
+-                    &grants,
+-                    |daemon, success| {
+-                        telemetry::capture_mcp_startup_completed(
+-                            "daemon_proxy",
+-                            daemon.telemetry_value(),
+-                            success,
+-                            startup_started.elapsed(),
+-                        )
+-                    },
+-                ),
++                Ok(false) => {
++                    run_mcp_service_proxy(socket, claude_code_compat, &grants, startup_started)
++                }
+             };
+             if let Err(e) = result {
+                 eprintln!("cua-driver-rs: {e}");
+@@ -1205,19 +1267,9 @@ fn main() -> anyhow::Result<()> {
+                     run_mcp_direct(claude_code_compat)
+                 }
+                 Err(error) => Err(error),
+-                Ok(false) => cli::run_mcp_via_daemon_proxy(
+-                    socket,
+-                    claude_code_compat,
+-                    &grants,
+-                    |daemon, success| {
+-                        telemetry::capture_mcp_startup_completed(
+-                            "daemon_proxy",
+-                            daemon.telemetry_value(),
+-                            success,
+-                            startup_started.elapsed(),
+-                        )
+-                    },
+-                ),
++                Ok(false) => {
++                    run_mcp_service_proxy(socket, claude_code_compat, &grants, startup_started)
++                }
+             };
+             if let Err(e) = result {
+                 eprintln!("cua-driver-rs: {e}");
+diff --git a/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs b/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs
+index fb9d11b80..2b5bda252 100644
+--- a/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs
++++ b/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs
+@@ -145,6 +145,20 @@ async fn run_with_service<R, W>(
+     reader: &mut R,
+     writer: W,
+ ) -> anyhow::Result<()>
++where
++    R: AsyncBufRead + Unpin,
++    W: AsyncWrite + Unpin + Send + 'static,
++{
++    run_with_activity(sdk, service, reader, writer, None).await
++}
++
++async fn run_with_activity<R, W>(
++    sdk: Arc<crate::sdk_adapter::SdkAdapter>,
++    service: Arc<Service>,
++    reader: &mut R,
++    writer: W,
++    activity: Option<crate::serve::DaemonActivity>,
++) -> anyhow::Result<()>
+ where
+     R: AsyncBufRead + Unpin,
+     W: AsyncWrite + Unpin + Send + 'static,
+@@ -249,8 +263,31 @@ where
+         let sdk = sdk.clone();
+         let session = session.clone();
+         let serial = legacy_serial.clone();
++        let activity = activity.clone();
++        let is_tool_activity =
++            request.method == "tools/call" || request.method == format!("{PREFIX}exchange");
+         pending.insert(key.clone());
+         tasks.spawn(async move {
++            let _activity = if is_tool_activity {
++                match activity.as_ref().map(|activity| activity.begin_tool_call()) {
++                    Some(Some(guard)) => Some(guard),
++                    Some(None) => {
++                        write_response(
++                            &writer,
++                            Response::error(
++                                id.clone(),
++                                -32000,
++                                "daemon is shutting down after inactivity; reconnect and retry",
++                            ),
++                        )
++                        .await?;
++                        return Ok::<_, anyhow::Error>(key);
++                    }
++                    None => None,
++                }
++            } else {
++                None
++            };
+             let response = if request.method.starts_with(PREFIX) {
+                 typed_request(service, request).await
+             } else {
+@@ -318,6 +355,7 @@ pub(crate) async fn accept<R, W>(
+     sdk: Arc<crate::sdk_adapter::SdkAdapter>,
+     reader: R,
+     mut writer: W,
++    activity: Option<crate::serve::DaemonActivity>,
+ ) -> anyhow::Result<()>
+ where
+     R: AsyncBufRead + Unpin,
+@@ -335,7 +373,7 @@ where
+         .await?;
+     writer.flush().await?;
+     anyhow::ensure!(enabled, "MCP envelope stream is disabled");
+-    run_with_service(sdk, service?, &mut { reader }, writer).await
++    run_with_activity(sdk, service?, &mut { reader }, writer, activity).await
+ }
+ 
+ pub(crate) async fn proxy(socket_path: &str) -> anyhow::Result<()> {
+diff --git a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs b/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
+index 02b4498be..1ff6d791e 100644
+--- a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
++++ b/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
+@@ -16,6 +16,7 @@
+ //!   Putting the proxy here avoids `mcp-server → cua-driver` reverse
+ //!   coupling.
+ 
++use std::collections::{HashMap, VecDeque};
+ use std::sync::Arc;
+ 
+ use cua_driver_core::mcp_wire::{self, ProtocolSession};
+@@ -32,20 +33,36 @@ use crate::serve::{
+     is_daemon_listening, send_request, DaemonRequest, DaemonResponse, ToolObservationOrigin,
+ };
+ 
++pub(crate) const DIRECT_WORKER_ENV: &str = "CUA_DRIVER_DIRECT_MCP_WORKER";
++pub(crate) const SERVICE_PROXY_WORKER_ENV: &str = "CUA_DRIVER_SERVICE_MCP_WORKER";
++const DIRECT_WORKER_INIT_ID: &str = "cua-idle-supervisor-init";
++const DIRECT_WORKER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
++const DIRECT_WORKER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
++
+ /// Run stdio MCP directly over an SDK-owned runtime.
+ ///
+-/// Windows and Linux use this when no explicit service endpoint was selected.
+-/// The runtime lives exactly as long as stdin: EOF ends every observed public
+-/// session, drains admitted work through `shutdown`, and releases process
+-/// ownership before returning.
+-pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Result<()> {
++/// The stdio endpoint remains alive for its MCP host, but the desktop runtime
++/// is created only for actual `tools/call` requests and is released after the
++/// idle timeout. A later call rebuilds it through `driver_factory`, so an
++/// idle host connection does not pin the platform runtime or prevent wake-on-use.
++pub async fn run_direct<F>(
++    mut driver_factory: F,
++    tools_list: serde_json::Value,
++) -> anyhow::Result<()>
++where
++    F: FnMut() -> anyhow::Result<Arc<cua_driver_sdk::CuaDriver>>,
++{
+     // Direct stdio is an action endpoint just like `serve`; enforce the same
+     // admin lock, bounded-manifest approval/expiry, and legacy-approval
+     // consistency before the first request can be read.
+     cua_driver_core::authorization::validate_startup_authorization()?;
+     validate_configured_policy()?;
+-    let sdk = crate::sdk_adapter::SdkAdapter::load(driver.clone()).await?;
+     if crate::mcp_envelope::configured()? {
++        // Typed envelopes hold a transport-owned receiver state that is not
++        // reconstructed by the legacy JSON-RPC loop below. Keep that opt-in
++        // transport on its existing explicit lifetime contract.
++        let driver = driver_factory()?;
++        let sdk = crate::sdk_adapter::SdkAdapter::load(driver).await?;
+         let result = crate::mcp_envelope::run(
+             sdk.clone(),
+             BufReader::new(tokio::io::stdin()),
+@@ -55,33 +72,72 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
+         sdk.shutdown().await.map_err(anyhow::Error::msg)?;
+         return result;
+     }
++
++    let idle_timeout = crate::serve::configured_idle_shutdown_timeout(
++        false,
++        false,
++        cfg!(target_os = "macos"),
++        std::env::var("CUA_DRIVER_IDLE_SHUTDOWN_SECONDS")
++            .ok()
++            .as_deref(),
++    );
++    if let Some(raw) = std::env::var("CUA_DRIVER_IDLE_SHUTDOWN_SECONDS").ok() {
++        if raw.parse::<u64>().is_err() {
++            eprintln!(
++                "ignoring invalid CUA_DRIVER_IDLE_SHUTDOWN_SECONDS; expected whole seconds (0 disables)"
++            );
++        }
++    }
++
++    // MCP metadata and tool inventory do not require the platform runtime.
++    // Hosts may keep this process open for a long time without using CUA.
++    let tools_list = Arc::new(tools_list);
++    let mut sdk: Option<Arc<crate::sdk_adapter::SdkAdapter>> = None;
+     let stdin = tokio::io::stdin();
+     let stdout = tokio::io::stdout();
+-    let mut reader = BufReader::new(stdin);
++    let mut reader = BufReader::new(stdin).lines();
+     let mut writer = tokio::io::BufWriter::new(stdout);
+-    let mut line = String::new();
+     let mut session_observed = false;
+     let mut protocol_session = ProtocolSession::default();
+     let transport_session = format!("mcp-{}", uuid::Uuid::new_v4());
+-    struct DirectTransportCleanup {
+-        sdk: Arc<crate::sdk_adapter::SdkAdapter>,
+-        transport_session: String,
+-    }
+-    impl Drop for DirectTransportCleanup {
+-        fn drop(&mut self) {
+-            self.sdk.end_transport_sessions(&self.transport_session);
+-        }
+-    }
+-    let _cleanup = DirectTransportCleanup {
+-        sdk: sdk.clone(),
+-        transport_session: transport_session.clone(),
+-    };
++    let mut last_tool_activity = std::time::Instant::now();
++    let mut next_release_attempt = None;
+ 
+     loop {
+-        line.clear();
+-        if reader.read_line(&mut line).await? == 0 {
+-            break;
+-        }
++        let idle_deadline = sdk.as_ref().and_then(|_| {
++            idle_timeout
++                .map(|timeout| next_release_attempt.unwrap_or_else(|| last_tool_activity + timeout))
++        });
++        let line = tokio::select! {
++            result = reader.next_line() => result?,
++            _ = async {
++                tokio::time::sleep_until(tokio::time::Instant::from_std(
++                    idle_deadline.expect("guarded idle deadline"),
++                )).await;
++            }, if idle_deadline.is_some() => {
++                if let Some(runtime) = sdk.take() {
++                    runtime.end_transport_sessions(&transport_session);
++                    match runtime.shutdown().await {
++                        Ok(()) => {
++                            next_release_attempt = None;
++                            eprintln!(
++                                "Cua Driver MCP runtime idle for {} seconds; released. The stdio endpoint remains ready to restart it on the next tool call.",
++                                idle_timeout.expect("idle deadline requires timeout").as_secs()
++                            );
++                        }
++                        Err(error) => {
++                            tracing::warn!("idle Cua Driver MCP runtime shutdown failed; retaining it for retry: {error}");
++                            sdk = Some(runtime);
++                            next_release_attempt = Some(
++                                std::time::Instant::now() + std::time::Duration::from_secs(60),
++                            );
++                        }
++                    }
++                }
++                continue;
++            }
++        };
++        let Some(line) = line else { break };
+         let trimmed = line.trim();
+         if trimmed.is_empty() {
+             continue;
+@@ -93,62 +149,90 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
+             }
+             Ok(request) if request.is_notification() => continue,
+             Ok(mut request) => {
+-                let admission = protocol_session.validate(&request).and_then(|era| {
++                let era = match protocol_session.validate(&request).and_then(|era| {
+                     if request.method == "tools/call" {
+                         mcp_wire::validate_tool_call(
+                             &request,
+                             request.id.clone().unwrap_or_default(),
+                             era,
+-                            &sdk.tools_list(),
++                            &tools_list,
+                         )?;
+                     }
+                     Ok(era)
+-                });
+-                if let Err(response) = admission {
+-                    writer
+-                        .write_all(serde_json::to_string(&response)?.as_bytes())
+-                        .await?;
+-                    writer.write_all(b"\n").await?;
+-                    writer.flush().await?;
+-                    continue;
+-                }
++                }) {
++                    Ok(era) => era,
++                    Err(response) => {
++                        write_stdio_response(&mut writer, response).await?;
++                        continue;
++                    }
++                };
+                 apply_direct_session_identity(&mut request, &transport_session);
+                 let initialize_metadata = (!session_observed)
+                     .then(|| request.initialize_metadata())
+                     .flatten();
+-                let session_context = request.tool_call().ok().and_then(|call| {
+-                    sdk.begin_tool_call(
+-                        &call.name,
+-                        &call.args,
+-                        cua_driver_core::session::SessionTransport::McpStdio,
+-                        cua_driver_core::session::SessionClientKind::Mcp,
+-                    )
+-                });
+-                let timer = tool_observation_timer(
+-                    &request,
+-                    |name| sdk.is_known_tool(name),
+-                    StdioExecutionPath::DirectDaemon,
+-                );
+                 let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+-                let response = cua_driver_core::server::handle_request_with_transport_session(
+-                    request,
+-                    id,
+-                    sdk.as_ref(),
+-                    &transport_session,
+-                )
+-                .await;
++                let method = request.method.clone();
++                let response = if method == "initialize" {
++                    Response::ok(id.clone(), initialize_result())
++                } else if let Some(response) =
++                    mcp_wire::handle_metadata_request(&request, id.clone())
++                {
++                    response
++                } else if method == "tools/list" {
++                    Response::ok(id.clone(), (*tools_list).clone())
++                } else if method == "tools/call" {
++                    last_tool_activity = std::time::Instant::now();
++                    next_release_attempt = None;
++                    let runtime = match ensure_direct_sdk(&mut sdk, &mut driver_factory).await {
++                        Ok(runtime) => runtime,
++                        Err(error) => {
++                            let response = Response::error(id.clone(), -32603, error.to_string());
++                            writer
++                                .write_all(serde_json::to_string(&response)?.as_bytes())
++                                .await?;
++                            writer.write_all(b"\n").await?;
++                            writer.flush().await?;
++                            continue;
++                        }
++                    };
++                    apply_direct_session_identity(&mut request, &transport_session);
++                    let session_context = request.tool_call().ok().and_then(|call| {
++                        runtime.begin_tool_call(
++                            &call.name,
++                            &call.args,
++                            cua_driver_core::session::SessionTransport::McpStdio,
++                            cua_driver_core::session::SessionClientKind::Mcp,
++                        )
++                    });
++                    let timer = tool_observation_timer(
++                        &request,
++                        |name| runtime.is_known_tool(name),
++                        StdioExecutionPath::DirectDaemon,
++                    );
++                    let response = cua_driver_core::server::handle_request_with_transport_session(
++                        request,
++                        id.clone(),
++                        runtime.as_ref(),
++                        &transport_session,
++                    )
++                    .await;
++                    if let Some(timer) = timer {
++                        let outcome = timer.finish(&response);
++                        if let Some(context) = session_context {
++                            context.complete(&outcome);
++                        }
++                        observe_proxy_tool_completed(outcome);
++                    }
++                    last_tool_activity = std::time::Instant::now();
++                    response
++                } else {
++                    Response::method_not_found(id.clone(), &method)
++                };
+                 if let Some(metadata) = initialize_metadata {
+                     observe_proxy_session_started(metadata);
+                     session_observed = true;
+                 }
+-                if let Some(timer) = timer {
+-                    let outcome = timer.finish(&response);
+-                    if let Some(context) = session_context {
+-                        context.complete(&outcome);
+-                    }
+-                    observe_proxy_tool_completed(outcome);
+-                }
+-                response
++                mcp_wire::finish_response(era, &method, response)
+             }
+         };
+         let serialized = serde_json::to_string(&response).unwrap_or_else(|error| {
+@@ -161,7 +245,554 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
+         writer.flush().await?;
+     }
+ 
+-    sdk.shutdown().await.map_err(anyhow::Error::msg)
++    if let Some(runtime) = sdk {
++        runtime.end_transport_sessions(&transport_session);
++        runtime.shutdown().await.map_err(anyhow::Error::msg)?;
++    }
++    Ok(())
++}
++
++async fn ensure_direct_sdk<F>(
++    sdk: &mut Option<Arc<crate::sdk_adapter::SdkAdapter>>,
++    driver_factory: &mut F,
++) -> anyhow::Result<Arc<crate::sdk_adapter::SdkAdapter>>
++where
++    F: FnMut() -> anyhow::Result<Arc<cua_driver_sdk::CuaDriver>>,
++{
++    if sdk.is_none() {
++        let driver = driver_factory()?;
++        *sdk = Some(crate::sdk_adapter::SdkAdapter::load(driver).await?);
++    }
++    Ok(sdk.as_ref().expect("runtime was loaded").clone())
++}
++
++/// Keep the host-owned MCP stdio endpoint lightweight while supervising the
++/// native process that owns Cua Driver's desktop runtime. OpenCode does not
++/// reliably reconnect after an MCP child exits, so the endpoint must stay
++/// available to launch a fresh worker when the next `tools/call` arrives.
++pub async fn run_mcp_idle_supervisor(
++    executable: std::path::PathBuf,
++    arguments: Vec<std::ffi::OsString>,
++    tools_list: serde_json::Value,
++    worker_env: &'static str,
++    disable_worker_idle_timeout: bool,
++    envelopes: bool,
++) -> anyhow::Result<()> {
++    cua_driver_core::authorization::validate_startup_authorization()?;
++    validate_configured_policy()?;
++
++    let idle_timeout = crate::serve::configured_idle_shutdown_timeout(
++        false,
++        false,
++        cfg!(target_os = "macos"),
++        std::env::var("CUA_DRIVER_IDLE_SHUTDOWN_SECONDS")
++            .ok()
++            .as_deref(),
++    );
++    if let Some(raw) = std::env::var("CUA_DRIVER_IDLE_SHUTDOWN_SECONDS").ok() {
++        if raw.parse::<u64>().is_err() {
++            eprintln!(
++                "ignoring invalid CUA_DRIVER_IDLE_SHUTDOWN_SECONDS; expected whole seconds (0 disables)"
++            );
++        }
++    }
++
++    let tools_list = Arc::new(tools_list);
++    let mut worker: Option<DirectWorker> = None;
++    let mut last_tool_activity = std::time::Instant::now();
++    let stdin = tokio::io::stdin();
++    let stdout = tokio::io::stdout();
++    let mut reader = BufReader::new(stdin).lines();
++    let mut writer = tokio::io::BufWriter::new(stdout);
++    let mut deferred_lines = VecDeque::new();
++    let mut protocol_session = ProtocolSession::default();
++    let mut session_observed = false;
++    let mut worker_reaper = tokio::time::interval_at(
++        tokio::time::Instant::now() + std::time::Duration::from_millis(100),
++        std::time::Duration::from_millis(100),
++    );
++    worker_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
++
++    loop {
++        let idle_deadline = worker
++            .as_ref()
++            .and_then(|_| idle_timeout.map(|timeout| last_tool_activity + timeout));
++        let line = if let Some(line) = deferred_lines.pop_front() {
++            Some(line)
++        } else {
++            tokio::select! {
++                result = reader.next_line() => result?,
++                _ = async {
++                    tokio::time::sleep_until(tokio::time::Instant::from_std(
++                        idle_deadline.expect("guarded idle deadline"),
++                    )).await;
++                }, if idle_deadline.is_some() => {
++                    if let Some(worker) = worker.take() {
++                        worker.shutdown().await;
++                        eprintln!(
++                            "Cua Driver runtime process idle for {} seconds since the last real use; stopped. The MCP endpoint will start a new process when the runtime is next needed.",
++                            idle_timeout.expect("idle deadline requires timeout").as_secs()
++                        );
++                    }
++                    continue;
++                },
++                _ = worker_reaper.tick(), if worker.is_some() => {
++                    if let Some(current) = worker.as_mut() {
++                        if let Some(status) = current.child.try_wait()? {
++                            eprintln!(
++                                "Cua Driver runtime worker exited ({status}); the MCP endpoint will start a replacement when the runtime is next needed."
++                            );
++                            worker.take();
++                        }
++                    }
++                    continue;
++                }
++            }
++        };
++        let Some(line) = line else { break };
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            continue;
++        }
++
++        let request = match serde_json::from_str::<Request>(trimmed) {
++            Ok(request) if request.is_notification() => continue,
++            Ok(request) => request,
++            Err(error) => {
++                let response = Response::parse_error();
++                tracing::warn!("invalid MCP request at idle supervisor: {error}");
++                write_stdio_response(&mut writer, response).await?;
++                continue;
++            }
++        };
++        let era = match protocol_session.validate(&request) {
++            Ok(era) => era,
++            Err(response) => {
++                write_stdio_response(&mut writer, response).await?;
++                continue;
++            }
++        };
++        if let Err(response) = mcp_wire::validate_tool_call(
++            &request,
++            request.id.clone().unwrap_or_default(),
++            era,
++            &tools_list,
++        ) {
++            write_stdio_response(&mut writer, response).await?;
++            continue;
++        }
++
++        let id = request.id.clone().unwrap_or(serde_json::Value::Null);
++        let method = request.method.clone();
++        let initialize_metadata = (!session_observed)
++            .then(|| request.initialize_metadata())
++            .flatten();
++
++        let starts_worker =
++            method == "tools/call" || (envelopes && method.starts_with("cua/driver/v1/"));
++        let worker_exited = match worker.as_mut() {
++            Some(current) => current.child.try_wait()?.is_some(),
++            None => false,
++        };
++        if worker_exited {
++            worker.take();
++        }
++        if starts_worker {
++            let request_line = trimmed.to_owned();
++            let call_result: anyhow::Result<String> = async {
++                if worker.is_none() {
++                    let mut command = tokio::process::Command::new(&executable);
++                    command.args(&arguments).env(worker_env, "1");
++                    if disable_worker_idle_timeout {
++                        // This mode's parent owns the process timeout. The
++                        // child stays until the parent closes stdin.
++                        command.env("CUA_DRIVER_IDLE_SHUTDOWN_SECONDS", "0");
++                    }
++                    worker = Some(
++                        tokio::time::timeout(
++                            DIRECT_WORKER_START_TIMEOUT,
++                            DirectWorker::spawn(command),
++                        )
++                        .await
++                        .map_err(|_| anyhow::anyhow!("Cua Driver worker startup timed out"))??,
++                    );
++                    eprintln!("Cua Driver runtime process started for MCP tools/call.");
++                }
++                let response = tokio::time::timeout(DIRECT_WORKER_CALL_TIMEOUT, async {
++                    let direct_worker = worker.as_mut().expect("worker was started");
++                    exchange_worker_request_with_controls(
++                        direct_worker.stdin.as_mut().expect("worker stdin is open"),
++                        &mut direct_worker.stdout,
++                        &mut direct_worker.output_buffer,
++                        &request_line,
++                        &mut reader,
++                        &mut writer,
++                        &mut deferred_lines,
++                        envelopes,
++                    )
++                    .await
++                })
++                .await
++                .map_err(|_| {
++                    anyhow::anyhow!(
++                        "Cua Driver tool call timed out after {} seconds; outcome may be unknown",
++                        DIRECT_WORKER_CALL_TIMEOUT.as_secs()
++                    )
++                })??;
++                Ok(response)
++            }
++            .await;
++            if worker_method_counts_as_use(&method) {
++                last_tool_activity = std::time::Instant::now();
++            }
++
++            let response_line = match call_result {
++                Ok(response_line) => response_line,
++                Err(error) => {
++                    if let Some(worker) = worker.take() {
++                        worker.shutdown().await;
++                    }
++                    let response = Response::error(
++                        id,
++                        -32603,
++                        format!(
++                            "Cua Driver worker disconnected during this call; outcome may be unknown. Observe the target state before retrying. {error}"
++                        ),
++                    );
++                    write_stdio_response(
++                        &mut writer,
++                        mcp_wire::finish_response(era, &method, response),
++                    )
++                    .await?;
++                    if let Some(metadata) = initialize_metadata {
++                        observe_proxy_session_started(metadata);
++                        session_observed = true;
++                    }
++                    continue;
++                }
++            };
++            if let Some(metadata) = initialize_metadata {
++                observe_proxy_session_started(metadata);
++                session_observed = true;
++            }
++            writer.write_all(response_line.as_bytes()).await?;
++            writer.write_all(b"\n").await?;
++            writer.flush().await?;
++            continue;
++        }
++
++        let response = if method == "initialize" {
++            let mut result = initialize_result();
++            if envelopes {
++                result["capabilities"]["experimental"][crate::mcp_envelope::CAPABILITY] =
++                    serde_json::json!({"version": 1});
++            }
++            Response::ok(id, result)
++        } else if method == "tools/list" {
++            Response::ok(id, (*tools_list).clone())
++        } else if let Some(response) = mcp_wire::handle_metadata_request(&request, id.clone()) {
++            response
++        } else {
++            Response::method_not_found(id, &method)
++        };
++        if let Some(metadata) = initialize_metadata {
++            observe_proxy_session_started(metadata);
++            session_observed = true;
++        }
++        write_stdio_response(
++            &mut writer,
++            mcp_wire::finish_response(era, &method, response),
++        )
++        .await?;
++    }
++
++    if let Some(worker) = worker.take() {
++        worker.shutdown().await;
++    }
++    Ok(())
++}
++
++fn worker_method_counts_as_use(method: &str) -> bool {
++    matches!(
++        method,
++        "tools/call" | "cua/driver/v1/open" | "cua/driver/v1/exchange"
++    )
++}
++
++async fn write_stdio_response<W: AsyncWrite + Unpin>(
++    writer: &mut W,
++    response: Response,
++) -> anyhow::Result<()> {
++    writer
++        .write_all(serde_json::to_string(&response)?.as_bytes())
++        .await?;
++    writer.write_all(b"\n").await?;
++    writer.flush().await?;
++    Ok(())
++}
++
++struct DirectWorker {
++    child: tokio::process::Child,
++    stdin: Option<tokio::process::ChildStdin>,
++    stdout: BufReader<tokio::process::ChildStdout>,
++    output_buffer: Vec<u8>,
++}
++
++impl DirectWorker {
++    async fn spawn(mut command: tokio::process::Command) -> anyhow::Result<Self> {
++        command
++            .stdin(std::process::Stdio::piped())
++            .stdout(std::process::Stdio::piped())
++            .stderr(std::process::Stdio::inherit())
++            .kill_on_drop(true);
++        let mut child = command.spawn()?;
++        let stdin = child
++            .stdin
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("Cua Driver worker stdin was not piped"))?;
++        let stdout = child
++            .stdout
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("Cua Driver worker stdout was not piped"))?;
++        let mut worker = Self {
++            child,
++            stdin: Some(stdin),
++            stdout: BufReader::new(stdout),
++            output_buffer: Vec::new(),
++        };
++
++        let initialize = serde_json::json!({
++            "jsonrpc": "2.0",
++            "id": DIRECT_WORKER_INIT_ID,
++            "method": "initialize",
++            "params": {
++                "protocolVersion": "2025-06-18",
++                "capabilities": {},
++                "clientInfo": {"name": "cua-idle-supervisor", "version": "1"}
++            }
++        })
++        .to_string();
++        let response =
++            tokio::time::timeout(DIRECT_WORKER_START_TIMEOUT, worker.exchange(&initialize))
++                .await
++                .map_err(|_| anyhow::anyhow!("Cua Driver worker initialize timed out"))??;
++        let response: serde_json::Value = serde_json::from_str(&response)?;
++        anyhow::ensure!(
++            response.get("id").and_then(serde_json::Value::as_str) == Some(DIRECT_WORKER_INIT_ID)
++                && response.get("result").is_some(),
++            "Cua Driver worker did not initialize: {response}"
++        );
++        worker
++            .write_notification("notifications/initialized")
++            .await?;
++        Ok(worker)
++    }
++
++    async fn exchange(&mut self, request: &str) -> anyhow::Result<String> {
++        let request_value: serde_json::Value = serde_json::from_str(request)?;
++        let expected_id = request_value
++            .get("id")
++            .cloned()
++            .ok_or_else(|| anyhow::anyhow!("MCP request has no id"))?;
++        let stdin = self
++            .stdin
++            .as_mut()
++            .ok_or_else(|| anyhow::anyhow!("Cua Driver worker stdin is closed"))?;
++        stdin.write_all(request.as_bytes()).await?;
++        stdin.write_all(b"\n").await?;
++        stdin.flush().await?;
++
++        loop {
++            let Some(response_line) =
++                read_worker_line(&mut self.stdout, &mut self.output_buffer).await?
++            else {
++                anyhow::bail!("Cua Driver worker closed stdout before replying");
++            };
++            let response: serde_json::Value = serde_json::from_str(response_line.trim())?;
++            if response.get("id") == Some(&expected_id) {
++                return Ok(response_line.trim_end().to_owned());
++            }
++        }
++    }
++
++    async fn write_notification(&mut self, method: &str) -> anyhow::Result<()> {
++        let stdin = self
++            .stdin
++            .as_mut()
++            .ok_or_else(|| anyhow::anyhow!("Cua Driver worker stdin is closed"))?;
++        stdin
++            .write_all(
++                serde_json::json!({"jsonrpc":"2.0","method":method})
++                    .to_string()
++                    .as_bytes(),
++            )
++            .await?;
++        stdin.write_all(b"\n").await?;
++        stdin.flush().await?;
++        Ok(())
++    }
++
++    async fn shutdown(mut self) {
++        // Closing stdin gives the worker a normal MCP EOF so it can end its
++        // sessions and shut down the SDK before the process is force-killed.
++        drop(self.stdin.take());
++        if tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
++            .await
++            .is_err()
++        {
++            tracing::warn!("Cua Driver worker did not exit after stdin EOF; terminating it");
++            let _ = self.child.kill().await;
++            let _ = self.child.wait().await;
++        }
++    }
++}
++
++async fn read_worker_line<R>(
++    stdout: &mut R,
++    output_buffer: &mut Vec<u8>,
++) -> anyhow::Result<Option<String>>
++where
++    R: AsyncBufRead + Unpin,
++{
++    let read = stdout.read_until(b'\n', output_buffer).await?;
++    if read == 0 {
++        return Ok(None);
++    }
++    let bytes = std::mem::take(output_buffer);
++    Ok(Some(String::from_utf8(bytes)?))
++}
++
++async fn write_worker_line<W>(stdin: &mut W, line: &str) -> anyhow::Result<()>
++where
++    W: AsyncWrite + Unpin,
++{
++    stdin.write_all(line.trim_end().as_bytes()).await?;
++    stdin.write_all(b"\n").await?;
++    stdin.flush().await?;
++    Ok(())
++}
++
++async fn write_stdio_line<W>(writer: &mut W, line: &str) -> anyhow::Result<()>
++where
++    W: AsyncWrite + Unpin,
++{
++    writer.write_all(line.trim_end().as_bytes()).await?;
++    writer.write_all(b"\n").await?;
++    writer.flush().await?;
++    Ok(())
++}
++
++fn valid_worker_request_id(id: &serde_json::Value) -> bool {
++    id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()
++}
++
++/// Keep typed envelope cancellation and close requests responsive while the
++/// worker is waiting for a native action. Other client requests stay queued
++/// until that action completes; worker responses are correlated by JSON-RPC id.
++async fn exchange_worker_request_with_controls<R, W, S, O>(
++    stdin: &mut S,
++    stdout: &mut O,
++    output_buffer: &mut Vec<u8>,
++    request_line: &str,
++    reader: &mut tokio::io::Lines<R>,
++    writer: &mut W,
++    deferred_lines: &mut VecDeque<String>,
++    envelopes: bool,
++) -> anyhow::Result<String>
++where
++    R: AsyncBufRead + Unpin,
++    W: AsyncWrite + Unpin,
++    S: AsyncWrite + Unpin,
++    O: AsyncBufRead + Unpin,
++{
++    let request: serde_json::Value = serde_json::from_str(request_line)?;
++    let expected_id = request
++        .get("id")
++        .cloned()
++        .ok_or_else(|| anyhow::anyhow!("MCP request has no id"))?;
++    let expected_key = expected_id.to_string();
++    write_worker_line(stdin, request_line).await?;
++
++    let mut control_ids = HashMap::<String, serde_json::Value>::new();
++    let mut request_response = None;
++    loop {
++        if control_ids.is_empty() {
++            if let Some(response) = request_response.take() {
++                return Ok(response);
++            }
++        }
++
++        tokio::select! {
++            worker_line = read_worker_line(stdout, output_buffer) => {
++                let Some(worker_line) = worker_line? else {
++                    for (_, id) in control_ids.drain() {
++                        let error = serde_json::json!({
++                            "jsonrpc": "2.0",
++                            "id": id,
++                            "error": {"code": -32603, "message": "worker cerró antes de responder al control"}
++                        });
++                        write_stdio_line(writer, &error.to_string()).await?;
++                    }
++                    anyhow::bail!("Cua Driver worker closed stdout before replying");
++                };
++                let message: serde_json::Value = match serde_json::from_str(worker_line.trim()) {
++                    Ok(message) => message,
++                    Err(_) => continue,
++                };
++                if message.get("method").and_then(serde_json::Value::as_str).is_some() {
++                    write_stdio_line(writer, &worker_line).await?;
++                    continue;
++                }
++                let Some(id) = message.get("id") else { continue };
++                let key = id.to_string();
++                if control_ids.remove(&key).is_some() {
++                    write_stdio_line(writer, &worker_line).await?;
++                } else if key == expected_key && request_response.is_none() {
++                    request_response = Some(worker_line.trim_end().to_owned());
++                }
++            }
++            client_line_result = reader.next_line() => {
++                let Some(client_line) = client_line_result? else {
++                    anyhow::bail!("MCP client closed stdin while a worker request was active");
++                };
++                let message: serde_json::Value = match serde_json::from_str(&client_line) {
++                    Ok(message) => message,
++                    Err(_) => {
++                        deferred_lines.push_back(client_line);
++                        continue;
++                    }
++                };
++                let id = message.get("id").filter(|id| valid_worker_request_id(id));
++                let key = id.map(serde_json::Value::to_string);
++                let method = message.get("method").and_then(serde_json::Value::as_str);
++                let valid_jsonrpc = message.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0");
++                let has_result = message.as_object().is_some_and(|object| object.contains_key("result"));
++                let has_error = message.as_object().is_some_and(|object| object.contains_key("error"));
++                let is_response = valid_jsonrpc && method.is_none() && key.is_some() && (has_result ^ has_error);
++                let is_cancellation = valid_jsonrpc
++                    && message.get("method").and_then(serde_json::Value::as_str) == Some("notifications/cancelled")
++                    && message.get("id").is_none();
++                let is_envelope_control = envelopes
++                    && valid_jsonrpc
++                    && matches!(method, Some("cua/driver/v1/cancel" | "cua/driver/v1/close"))
++                    && key.is_some();
++
++                if is_envelope_control {
++                    let control_key = key.expect("control requires id");
++                    if control_key == expected_key || control_ids.contains_key(&control_key) {
++                        deferred_lines.push_back(client_line);
++                        continue;
++                    }
++                    control_ids.insert(control_key, id.expect("control requires id").clone());
++                    write_worker_line(stdin, &client_line).await?;
++                } else if is_cancellation || is_response {
++                    write_worker_line(stdin, &client_line).await?;
++                } else {
++                    deferred_lines.push_back(client_line);
++                }
++            }
++        }
++    }
+ }
+ 
+ pub(crate) fn apply_direct_session_identity(request: &mut Request, transport_session: &str) {
+@@ -1019,6 +1650,193 @@ fn daemon_response_to_tool_result(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn envelope_lifecycle_controls_do_not_refresh_real_use_timeout() {
++        assert!(worker_method_counts_as_use("tools/call"));
++        assert!(worker_method_counts_as_use("cua/driver/v1/open"));
++        assert!(worker_method_counts_as_use("cua/driver/v1/exchange"));
++        assert!(!worker_method_counts_as_use("cua/driver/v1/cancel"));
++        assert!(!worker_method_counts_as_use("cua/driver/v1/close"));
++        assert!(!worker_method_counts_as_use("ping"));
++        assert!(!worker_method_counts_as_use("tools/list"));
++    }
++
++    #[test]
++    fn envelope_multiplexer_rejects_ids_the_worker_rejects() {
++        for id in [
++            serde_json::json!("request"),
++            serde_json::json!(0),
++            serde_json::json!(-1),
++            serde_json::json!(u64::MAX),
++        ] {
++            assert!(valid_worker_request_id(&id), "id={id}");
++        }
++        for id in [
++            serde_json::json!(null),
++            serde_json::json!(false),
++            serde_json::json!(1.5),
++            serde_json::json!({}),
++            serde_json::json!([]),
++        ] {
++            assert!(!valid_worker_request_id(&id), "id={id}");
++        }
++    }
++
++    #[tokio::test]
++    async fn supervisor_forwards_envelope_cancel_and_close_during_exchange() {
++        let (mut proxy_stdin, worker_stdin) = tokio::io::duplex(4096);
++        let (mut worker_stdout, proxy_stdout) = tokio::io::duplex(4096);
++        let (mut client_stdin, client_reader) = tokio::io::duplex(4096);
++        let (client_writer, client_stdout) = tokio::io::duplex(4096);
++
++        let worker = tokio::spawn(async move {
++            let mut reader = BufReader::new(worker_stdin);
++            let mut line = String::new();
++            reader.read_line(&mut line).await.unwrap();
++            assert_eq!(
++                serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
++                "action"
++            );
++            line.clear();
++            reader.read_line(&mut line).await.unwrap();
++            assert_eq!(
++                serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
++                2
++            );
++            line.clear();
++            reader.read_line(&mut line).await.unwrap();
++            assert_eq!(
++                serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
++                3
++            );
++            worker_stdout
++                .write_all(
++                    b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n{\"jsonrpc\":\"2.0\",\"id\":\"action\",\"result\":{\"ok\":false}}\n",
++                )
++                .await
++                .unwrap();
++        });
++
++        let exchange = tokio::spawn(async move {
++            let mut reader = BufReader::new(client_reader).lines();
++            let mut writer = tokio::io::BufWriter::new(client_writer);
++            let mut worker_reader = BufReader::new(proxy_stdout);
++            let mut output_buffer = Vec::new();
++            let mut deferred = VecDeque::new();
++            exchange_worker_request_with_controls(
++                &mut proxy_stdin,
++                &mut worker_reader,
++                &mut output_buffer,
++                r#"{"jsonrpc":"2.0","id":"action","method":"cua/driver/v1/exchange","params":{}}"#,
++                &mut reader,
++                &mut writer,
++                &mut deferred,
++                true,
++            )
++            .await
++        });
++
++        client_stdin
++            .write_all(
++                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"cua/driver/v1/cancel\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"cua/driver/v1/close\",\"params\":{}}\n",
++            )
++            .await
++            .unwrap();
++
++        let mut replies = BufReader::new(client_stdout);
++        let mut line = String::new();
++        replies.read_line(&mut line).await.unwrap();
++        assert_eq!(
++            serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
++            2
++        );
++        line.clear();
++        replies.read_line(&mut line).await.unwrap();
++        assert_eq!(
++            serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
++            3
++        );
++        let action = exchange.await.unwrap().unwrap();
++        assert_eq!(
++            serde_json::from_str::<serde_json::Value>(&action).unwrap()["id"],
++            "action"
++        );
++        worker.await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn fractional_control_id_does_not_block_exchange_response() {
++        let (mut proxy_stdin, worker_stdin) = tokio::io::duplex(4096);
++        let (mut worker_stdout, proxy_stdout) = tokio::io::duplex(4096);
++        let (mut client_stdin, client_reader) = tokio::io::duplex(4096);
++        client_stdin
++            .write_all(
++                b"{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"cua/driver/v1/cancel\",\"params\":{}}\n",
++            )
++            .await
++            .unwrap();
++
++        let worker = tokio::spawn(async move {
++            let mut reader = BufReader::new(worker_stdin);
++            let mut line = String::new();
++            reader.read_line(&mut line).await.unwrap();
++            assert_eq!(
++                serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
++                "action"
++            );
++            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++            worker_stdout
++                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"action\",\"result\":{\"ok\":true}}\n")
++                .await
++                .unwrap();
++            line.clear();
++            tokio::time::timeout(
++                std::time::Duration::from_secs(1),
++                reader.read_line(&mut line),
++            )
++            .await
++            .expect("worker stdin should close after the action response")
++            .unwrap()
++        });
++
++        let mut reader = BufReader::new(client_reader).lines();
++        let mut writer = Vec::new();
++        let mut worker_reader = BufReader::new(proxy_stdout);
++        let mut output_buffer = Vec::new();
++        let mut deferred = VecDeque::new();
++        let action = exchange_worker_request_with_controls(
++            &mut proxy_stdin,
++            &mut worker_reader,
++            &mut output_buffer,
++            r#"{"jsonrpc":"2.0","id":"action","method":"cua/driver/v1/exchange","params":{}}"#,
++            &mut reader,
++            &mut writer,
++            &mut deferred,
++            true,
++        )
++        .await
++        .unwrap();
++        assert_eq!(
++            serde_json::from_str::<serde_json::Value>(&action).unwrap()["id"],
++            "action"
++        );
++        assert!(
++            writer.is_empty(),
++            "a rejected ID must not produce a control response"
++        );
++        assert_eq!(deferred.len(), 1);
++        assert_eq!(
++            serde_json::from_str::<serde_json::Value>(deferred.front().unwrap()).unwrap()["id"],
++            1.5
++        );
++        drop(proxy_stdin);
++        assert_eq!(
++            worker.await.unwrap(),
++            0,
++            "fractional control was not sent to the worker"
++        );
++    }
++
+     #[tokio::test]
+     async fn modern_proxy_metadata_and_rejections_need_no_daemon_call() {
+         use serde_json::json;
+diff --git a/libs/cua-driver/rust/crates/cua-driver/src/serve.rs b/libs/cua-driver/rust/crates/cua-driver/src/serve.rs
+index 518df3518..1e855fd94 100644
+--- a/libs/cua-driver/rust/crates/cua-driver/src/serve.rs
++++ b/libs/cua-driver/rust/crates/cua-driver/src/serve.rs
+@@ -22,7 +22,7 @@
+ //! namespace on every platform.
+ 
+ use std::collections::{HashMap, HashSet};
+-use std::sync::{Mutex, OnceLock};
++use std::sync::{Arc, Mutex, OnceLock};
+ 
+ pub use cua_driver_core::daemon::{
+     is_daemon_listening, send_request, socket_path_for_namespace, DaemonRequest, DaemonResponse,
+@@ -89,6 +89,65 @@ fn reap_finished_connections(connection_tasks: &mut tokio::task::JoinSet<()>) {
+     }
+ }
+ 
++#[derive(Clone)]
++pub(crate) struct DaemonActivity(Arc<Mutex<DaemonActivityState>>);
++
++struct DaemonActivityState {
++    last_tool_activity: std::time::Instant,
++    active_tool_calls: usize,
++    shutting_down: bool,
++}
++
++pub(crate) struct DaemonToolCallGuard(DaemonActivity);
++
++impl DaemonActivity {
++    fn new() -> Self {
++        Self(Arc::new(Mutex::new(DaemonActivityState {
++            last_tool_activity: std::time::Instant::now(),
++            active_tool_calls: 0,
++            shutting_down: false,
++        })))
++    }
++
++    pub(crate) fn begin_tool_call(&self) -> Option<DaemonToolCallGuard> {
++        let mut state = self.0.lock().unwrap();
++        if state.shutting_down {
++            return None;
++        }
++        state.active_tool_calls += 1;
++        state.last_tool_activity = std::time::Instant::now();
++        Some(DaemonToolCallGuard(self.clone()))
++    }
++
++    fn begin_shutdown_if_idle(
++        &self,
++        timeout: std::time::Duration,
++        now: std::time::Instant,
++    ) -> bool {
++        let mut state = self.0.lock().unwrap();
++        if !state.shutting_down
++            && idle_shutdown_due(
++                state.last_tool_activity,
++                state.active_tool_calls,
++                timeout,
++                now,
++            )
++        {
++            state.shutting_down = true;
++            return true;
++        }
++        false
++    }
++}
++
++impl Drop for DaemonToolCallGuard {
++    fn drop(&mut self) {
++        let mut state = self.0 .0.lock().unwrap();
++        state.active_tool_calls = state.active_tool_calls.saturating_sub(1);
++        state.last_tool_activity = std::time::Instant::now();
++    }
++}
++
+ async fn take_trusted_resume_record(
+     registry: &TrustedResumeRegistry,
+     credential: &str,
+@@ -609,6 +668,46 @@ fn prepare_embedded_socket_path(socket_path: &str, embedded: bool) -> anyhow::Re
+ static PERMISSION_GATE_PENDING: std::sync::atomic::AtomicBool =
+     std::sync::atomic::AtomicBool::new(false);
+ 
++const DEFAULT_MACOS_DAEMON_IDLE_TIMEOUT: std::time::Duration =
++    std::time::Duration::from_secs(4 * 60 * 60);
++const IDLE_SHUTDOWN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
++const IDLE_SHUTDOWN_SECONDS_ENV: &str = "CUA_DRIVER_IDLE_SHUTDOWN_SECONDS";
++
++pub(crate) fn configured_idle_shutdown_timeout(
++    embedded: bool,
++    external_listener: bool,
++    macos: bool,
++    override_seconds: Option<&str>,
++) -> Option<std::time::Duration> {
++    if embedded || external_listener {
++        return None;
++    }
++    match override_seconds {
++        Some(raw) => raw
++            .parse::<u64>()
++            .ok()
++            .filter(|seconds| *seconds > 0)
++            .map(std::time::Duration::from_secs),
++        None if macos => Some(DEFAULT_MACOS_DAEMON_IDLE_TIMEOUT),
++        None => None,
++    }
++}
++
++fn idle_shutdown_due(
++    last_tool_activity: std::time::Instant,
++    active_tool_calls: usize,
++    timeout: std::time::Duration,
++    now: std::time::Instant,
++) -> bool {
++    active_tool_calls == 0 && now.saturating_duration_since(last_tool_activity) >= timeout
++}
++
++fn idle_shutdown_reaper(interval: std::time::Duration) -> tokio::time::Interval {
++    let mut reaper = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
++    reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
++    reaper
++}
++
+ // Only the macOS first-launch gate sets it; elsewhere it stays false.
+ #[cfg(target_os = "macos")]
+ /// Mark whether the macOS first-launch gate is still waiting for TCC grants.
+@@ -942,6 +1041,22 @@ pub async fn run_serve(
+     }
+ 
+     let embedded = cua_driver_core::embedded_mode();
++    let mcp_http_port = crate::mcp_http::configured_port()?;
++    let driver_service_http_port = crate::driver_service_http::configured_port()?;
++    let external_listener = mcp_http_port.is_some() || driver_service_http_port.is_some();
++    let idle_timeout = configured_idle_shutdown_timeout(
++        embedded,
++        external_listener,
++        cfg!(target_os = "macos"),
++        std::env::var(IDLE_SHUTDOWN_SECONDS_ENV).ok().as_deref(),
++    );
++    if let Some(raw) = std::env::var(IDLE_SHUTDOWN_SECONDS_ENV).ok() {
++        if raw.parse::<u64>().is_err() {
++            eprintln!(
++                "ignoring invalid {IDLE_SHUTDOWN_SECONDS_ENV}; expected whole seconds (0 disables)"
++            );
++        }
++    }
+     // Embedded endpoints are host-owned. The daemon must never unlink an
+     // arbitrary pre-existing path between the host's safety check and bind.
+     prepare_embedded_socket_path(socket_path, embedded)?;
+@@ -978,15 +1093,26 @@ pub async fn run_serve(
+ 
+     // Idle-session and recording maintenance is owned by the SDK runtime so
+     // direct embedded applications and daemon-backed clients behave alike.
+-    if let Some(port) = crate::mcp_http::configured_port()? {
++    if let Some(port) = mcp_http_port {
+         crate::mcp_http::spawn(sdk.clone(), port)?;
+     }
+ 
+-    let _envelope_http = match crate::driver_service_http::configured_port()? {
++    let _envelope_http = match driver_service_http_port {
+         Some(port) => Some(crate::driver_service_http::start(sdk.clone(), port).await?),
+         None => None,
+     };
+ 
++    // A persistent MCP control socket only proves the client process is alive;
++    // it does not prove that a user is using CUA. Count actual tool calls and
++    // protect calls already in flight. Embedded and external HTTP listeners
++    // keep their own lifecycle and are excluded above. The MCP supervisor
++    // reconnects on the next request after this daemon exits.
++    let idle_check_interval = idle_timeout.map_or(IDLE_SHUTDOWN_CHECK_INTERVAL, |timeout| {
++        timeout.min(IDLE_SHUTDOWN_CHECK_INTERVAL)
++    });
++    let idle_activity = DaemonActivity::new();
++    let mut idle_reaper = idle_shutdown_reaper(idle_check_interval);
++
+     loop {
+         tokio::select! {
+             result = listener.accept() => {
+@@ -1002,6 +1128,7 @@ pub async fn run_serve(
+                 let reg = sdk.clone();
+                 let shutdown_tx2 = shutdown_tx.clone();
+                 let trusted_resume_registry = trusted_resume_registry.clone();
++                let idle_activity = idle_activity.clone();
+ 
+                 connection_tasks.spawn(async move {
+                     let (reader, mut writer) = stream.into_split();
+@@ -1039,7 +1166,12 @@ pub async fn run_serve(
+                             "mcp_envelope_stream" if control_session_id.is_none() && trusted_session.is_none() => {
+                                 // Existing local-peer authentication already passed.
+                                 // Registry and session lifetime belong to this stream.
+-                                let _ = crate::mcp_envelope::accept(reg.clone(), lines.into_inner(), writer).await;
++                                let _ = crate::mcp_envelope::accept(
++                                    reg.clone(),
++                                    lines.into_inner(),
++                                    writer,
++                                    Some(idle_activity.clone()),
++                                ).await;
+                                 return;
+                             }
+                             "metadata" => {
+@@ -1157,6 +1289,16 @@ pub async fn run_serve(
+                                 ).await;
+                             }
+                             "call" => {
++                                let Some(_activity) = idle_activity.begin_tool_call() else {
++                                    let resp = DaemonResponse::err(
++                                        "daemon is shutting down after inactivity; reconnect and retry",
++                                        75,
++                                    );
++                                    let _ = writer.write_all(
++                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
++                                    ).await;
++                                    continue;
++                                };
+                                 let resp = invoke_daemon_tool(&reg, req).await;
+                                 let _ = writer.write_all(
+                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+@@ -1249,6 +1391,16 @@ pub async fn run_serve(
+                                 ).await;
+                             }
+                             "trusted_session_call" => {
++                                let Some(_activity) = idle_activity.begin_tool_call() else {
++                                    let resp = DaemonResponse::err(
++                                        "daemon is shutting down after inactivity; reconnect and retry",
++                                        75,
++                                    );
++                                    let _ = writer.write_all(
++                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
++                                    ).await;
++                                    continue;
++                                };
+                                 let resp = match trusted_session.as_ref() {
+                                     Some(connection) => {
+                                         let name = req.name.unwrap_or_default();
+@@ -1371,6 +1523,21 @@ pub async fn run_serve(
+                     }
+                 });
+             }
++            _ = idle_reaper.tick(), if idle_timeout.is_some() => {
++                reap_finished_connections(&mut connection_tasks);
++                let now = std::time::Instant::now();
++                let timeout = idle_timeout.expect("enabled idle timer has a timeout");
++                if idle_activity.begin_shutdown_if_idle(timeout, now) {
++                    eprintln!(
++                        "Cua Driver daemon idle for {} seconds since the last tool call; shutting down cleanly.",
++                        timeout.as_secs()
++                    );
++                    let mut guard = shutdown_tx.lock().await;
++                    if let Some(tx) = guard.take() {
++                        let _ = tx.send(());
++                    }
++                }
++            }
+             _ = &mut shutdown_rx => {
+                 eprintln!("Cua Driver daemon shutting down.");
+                 break;
+@@ -1847,7 +2014,12 @@ pub async fn run_serve(
+                         match req.method.as_str() {
+                             "mcp_envelope_stream" if control_session_id.is_none() && trusted_session.is_none() => {
+                                 // Same transport-owned receiver as the Unix branch.
+-                                let _ = crate::mcp_envelope::accept(reg.clone(), lines.into_inner(), writer).await;
++                                let _ = crate::mcp_envelope::accept(
++                                    reg.clone(),
++                                    lines.into_inner(),
++                                    writer,
++                                    None,
++                                ).await;
+                                 return;
+                             }
+                             "metadata" => {
+@@ -2572,6 +2744,115 @@ mod socket_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod idle_shutdown_tests {
++    use super::{
++        configured_idle_shutdown_timeout, idle_shutdown_due, idle_shutdown_reaper, DaemonActivity,
++    };
++    use std::time::{Duration, Instant};
++
++    #[test]
++    fn standalone_macos_daemon_defaults_to_four_hours() {
++        assert_eq!(
++            configured_idle_shutdown_timeout(false, false, true, None),
++            Some(Duration::from_secs(4 * 60 * 60))
++        );
++        assert_eq!(
++            configured_idle_shutdown_timeout(false, false, false, None),
++            None
++        );
++    }
++
++    #[test]
++    fn embedded_and_external_listener_lifecycles_are_not_idle_stopped() {
++        assert_eq!(
++            configured_idle_shutdown_timeout(true, false, true, Some("1")),
++            None
++        );
++        assert_eq!(
++            configured_idle_shutdown_timeout(false, true, true, Some("1")),
++            None
++        );
++    }
++
++    #[test]
++    fn seconds_override_can_shorten_or_disable_the_timeout() {
++        assert_eq!(
++            configured_idle_shutdown_timeout(false, false, true, Some("12")),
++            Some(Duration::from_secs(12))
++        );
++        assert_eq!(
++            configured_idle_shutdown_timeout(false, false, true, Some("0")),
++            None
++        );
++        assert_eq!(
++            configured_idle_shutdown_timeout(false, false, true, Some("bad")),
++            None
++        );
++    }
++
++    #[test]
++    fn live_control_connections_do_not_count_as_tool_activity() {
++        let start = Instant::now();
++        let timeout = Duration::from_secs(30);
++        assert!(!idle_shutdown_due(
++            start,
++            0,
++            timeout,
++            start + timeout - Duration::from_secs(1)
++        ));
++        // A persistent MCP connection is not passed to this predicate, so it
++        // cannot pin the timer. Only a tool call still running protects it.
++        assert!(idle_shutdown_due(start, 0, timeout, start + timeout));
++        assert!(!idle_shutdown_due(start, 1, timeout, start + timeout));
++        assert!(!idle_shutdown_due(
++            start + timeout,
++            0,
++            timeout,
++            start + timeout + Duration::from_secs(1)
++        ));
++    }
++
++    #[test]
++    fn a_tool_call_cannot_start_after_idle_shutdown_is_claimed() {
++        let activity = DaemonActivity::new();
++        let now = Instant::now();
++        assert!(activity.begin_shutdown_if_idle(Duration::ZERO, now));
++        assert!(activity.begin_tool_call().is_none());
++    }
++
++    #[test]
++    fn an_admitted_tool_call_prevents_idle_shutdown_until_its_guard_drops() {
++        let activity = DaemonActivity::new();
++        let now = Instant::now();
++        let call = activity.begin_tool_call().expect("call should be admitted");
++        assert!(!activity.begin_shutdown_if_idle(Duration::ZERO, now));
++        drop(call);
++        assert!(activity.begin_shutdown_if_idle(Duration::ZERO, Instant::now()));
++    }
++
++    #[tokio::test]
++    async fn idle_reaper_keeps_its_deadline_when_other_select_arms_win() {
++        let interval = Duration::from_millis(20);
++        let started = Instant::now();
++        let mut reaper = idle_shutdown_reaper(interval);
++        let tick = tokio::time::timeout(Duration::from_millis(100), async {
++            for _ in 0..20 {
++                tokio::select! {
++                    _ = reaper.tick() => return,
++                    _ = tokio::time::sleep(Duration::from_millis(2)) => {}
++                }
++            }
++        })
++        .await;
++        assert!(
++            tick.is_ok(),
++            "periodic non-tool events must not restart the idle deadline"
++        );
++        assert!(started.elapsed() >= interval);
++    }
++}
++
+ #[cfg(all(test, unix))]
+ mod gate_tests {
+     //! Ended-session resurrection guard wired into the `call` dispatch.
+diff --git a/libs/cua-driver/rust/crates/cua-driver/tests/protocol_proxy_recovery_test.rs b/libs/cua-driver/rust/crates/cua-driver/tests/protocol_proxy_recovery_test.rs
+index ac146644d..97635293b 100644
+--- a/libs/cua-driver/rust/crates/cua-driver/tests/protocol_proxy_recovery_test.rs
++++ b/libs/cua-driver/rust/crates/cua-driver/tests/protocol_proxy_recovery_test.rs
+@@ -382,17 +382,31 @@ async fn real_proxies_recover_from_control_loss_without_waiting_for_stdin() {
+     let (control_tx, mut controls) = async_mpsc::unbounded_channel();
+     let relay_task = relay(&proxy_endpoint, daemon_endpoint.clone(), control_tx).await;
+     let mut idle = Client::spawn(&proxy_endpoint);
++    idle.request("tools/list", json!({}));
++    assert!(
++        tokio::time::timeout(Duration::from_millis(100), controls.recv())
++            .await
++            .is_err(),
++        "metadata-only MCP startup must not connect to the runtime daemon"
++    );
++    idle.call("start_session", json!({"session":"idle-client"}));
+     let idle_control = tokio::time::timeout(BOUND, controls.recv())
+         .await
+         .unwrap()
+         .unwrap();
+-    idle.call("start_session", json!({"session":"idle-client"}));
+     let mut peer = Client::spawn(&proxy_endpoint);
++    peer.request("tools/list", json!({}));
++    assert!(
++        tokio::time::timeout(Duration::from_millis(100), controls.recv())
++            .await
++            .is_err(),
++        "metadata-only MCP startup must not connect to the runtime daemon"
++    );
++    peer.call("start_session", json!({"session":"peer-client"}));
+     let _peer_control = tokio::time::timeout(BOUND, controls.recv())
+         .await
+         .unwrap()
+         .unwrap();
+-    peer.call("start_session", json!({"session":"peer-client"}));
+     session_active(&daemon_endpoint, "peer-client").await;
+     session_active(&daemon_endpoint, "idle-client").await;
+ 
+@@ -410,22 +424,42 @@ async fn real_proxies_recover_from_control_loss_without_waiting_for_stdin() {
+     idle.call("get_session_state", json!({"session":"idle-client"}));
+ 
+     let mut survivor = Client::spawn(&proxy_endpoint);
++    survivor.request("tools/list", json!({}));
++    assert!(
++        tokio::time::timeout(Duration::from_millis(100), controls.recv())
++            .await
++            .is_err(),
++        "metadata-only MCP startup must not connect to the runtime daemon"
++    );
++    survivor.call("start_session", json!({"session":"survivor"}));
+     let _survivor_control = tokio::time::timeout(BOUND, controls.recv())
+         .await
+         .unwrap()
+         .unwrap();
+-    survivor.call("start_session", json!({"session":"survivor"}));
+     idle_control
+         .send(())
+         .expect("idle control must still be connected");
+     assert!(idle.stdin.is_some(), "retain stdin during control loss");
+     assert!(
+-        !idle.process.exit().success(),
+-        "lost control must fail the proxy"
++        idle.process.0.try_wait().unwrap().is_none(),
++        "the lightweight MCP endpoint must survive worker control loss"
+     );
+-    idle.eof();
+     session_absent(&daemon_endpoint, "idle-client").await;
+     session_active(&daemon_endpoint, "survivor").await;
++    tokio::time::sleep(Duration::from_millis(150)).await;
++    idle.call("start_session", json!({"session":"idle-recovered"}));
++    let _recovered_control = tokio::time::timeout(BOUND, controls.recv())
++        .await
++        .unwrap()
++        .unwrap();
++    session_active(&daemon_endpoint, "idle-recovered").await;
++    drop(idle.stdin.take());
++    assert!(
++        idle.process.exit().success(),
++        "the MCP endpoint should exit cleanly when its host closes stdin"
++    );
++    idle.eof();
++    session_absent(&daemon_endpoint, "idle-recovered").await;
+     survivor.call("get_config", json!({"session":"survivor"}));
+     assert!(
+         daemon.0.try_wait().unwrap().is_none(),
+@@ -433,11 +467,18 @@ async fn real_proxies_recover_from_control_loss_without_waiting_for_stdin() {
+     );
+ 
+     let mut fresh = Client::spawn(&proxy_endpoint);
++    fresh.request("tools/list", json!({}));
++    assert!(
++        tokio::time::timeout(Duration::from_millis(100), controls.recv())
++            .await
++            .is_err(),
++        "metadata-only MCP startup must not connect to the runtime daemon"
++    );
++    fresh.call("get_config", json!({}));
+     let _fresh_control = tokio::time::timeout(BOUND, controls.recv())
+         .await
+         .unwrap()
+         .unwrap();
+-    fresh.call("get_config", json!({}));
+     fresh.call("start_session", json!({"session":"fresh-client"}));
+     fresh.call("get_session_state", json!({"session":"fresh-client"}));
+     survivor.call("get_config", json!({"session":"survivor"}));
