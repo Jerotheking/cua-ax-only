@@ -1,21 +1,51 @@
-diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
-index 8e4ed0d5..2446a8e4 100644
---- a/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
-+++ b/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
-@@ -894,6 +894,8 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
-         | "press_key"
-         | "hotkey"
-         | "set_value"
-+        | "focus"
-+        | "paste"
-         | "run_steps"
-         | "run_script"
-         | "invoke_menu"
+From a803489f9feb24c630e01cf633810011bbf7ff0b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jer=C3=B3nimo=20Rey?= <jerotherey@gmail.com>
+Date: Wed, 4 Nov 2026 23:51:51 -0600
+Subject: [PATCH] fix(cua-driver): keep AX-only actions in background
+
+---
+ .../cua-driver-core/src/browser/engine.rs     |   1 +
+ .../cua-driver-core/src/browser/v2_tests.rs   |   1 +
+ .../rust/crates/cua-driver/src/main.rs        |   5 +-
+ .../rust/crates/cua-driver/src/proxy.rs       |  21 ++-
+ .../platform-macos/src/browser/setup_ui.rs    | 120 ++++++++++++++++--
+ .../platform-macos/src/input/ax_actions.rs    |  42 ++++++
+ .../crates/platform-macos/src/tools/click.rs  |  88 ++++++++++++-
+ .../crates/platform-macos/src/tools/hotkey.rs |   5 +
+ .../platform-macos/src/tools/press_key.rs     |   5 +
+ .../crates/platform-macos/src/tools/scroll.rs |  36 ++++++
+ .../platform-macos/src/tools/type_text.rs     |   9 ++
+ 11 files changed, 312 insertions(+), 21 deletions(-)
+
+diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/browser/engine.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/browser/engine.rs
+index d9aea2e2a..9bf8ab6b1 100644
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/browser/engine.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/browser/engine.rs
+@@ -214,6 +214,7 @@ fn with_existing_profile_next_call(
+                 "window_id": window_id,
+                 "session": session,
+                 "strategy": { "kind": "existing_profile" },
++                "delivery_mode": "background",
+             },
+         }),
+     );
+diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/browser/v2_tests.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/browser/v2_tests.rs
+index 935a8bf9e..eda634b48 100644
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/browser/v2_tests.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/browser/v2_tests.rs
+@@ -1336,6 +1336,7 @@ async fn standalone_consumer_bind_without_grant_refuses_before_endpoint_discover
+                 "window_id": 7,
+                 "session": SESSION,
+                 "strategy": { "kind": "existing_profile" },
++                "delivery_mode": "background",
+             },
+         })
+     );
 diff --git a/libs/cua-driver/rust/crates/cua-driver/src/main.rs b/libs/cua-driver/rust/crates/cua-driver/src/main.rs
-index 88575cfc..548fab80 100644
+index a529477c6..9003865da 100644
 --- a/libs/cua-driver/rust/crates/cua-driver/src/main.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver/src/main.rs
-@@ -355,7 +355,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
+@@ -359,7 +359,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
  }
  
  fn inspect_tools_without_runtime_for(compatibility_mode: bool) -> serde_json::Value {
@@ -24,7 +54,7 @@ index 88575cfc..548fab80 100644
          cursor: cursor_overlay::CursorConfig {
              enabled: false,
              ..cursor_overlay::CursorConfig::default()
-@@ -367,7 +367,8 @@ fn inspect_tools_without_runtime_for(compatibility_mode: bool) -> serde_json::Va
+@@ -371,7 +371,8 @@ fn inspect_tools_without_runtime_for(compatibility_mode: bool) -> serde_json::Va
          register_host_tools: Some(register_host_tools),
          authorization_host: None,
          activity_observer: None,
@@ -35,10 +65,10 @@ index 88575cfc..548fab80 100644
  
  #[cfg(test)]
 diff --git a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs b/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
-index 1663111c..25de3e25 100644
+index e4f8c8409..1a73d3e56 100644
 --- a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
-@@ -19,7 +19,7 @@
+@@ -23,7 +23,7 @@ use std::collections::{HashMap, VecDeque};
  use std::sync::Arc;
  
  use cua_driver_core::mcp_wire::{self, ProtocolSession};
@@ -47,7 +77,7 @@ index 1663111c..25de3e25 100644
  use cua_driver_core::protocol::{initialize_result, Request, Response};
  use cua_driver_core::server::{
      observe_proxy_session_started, observe_proxy_tool_completed, tool_observation_timer,
-@@ -1238,6 +1238,23 @@ fn proxy_tool_result_response(
+@@ -1436,6 +1436,23 @@ fn proxy_tool_result_response(
      }
  }
  
@@ -71,7 +101,7 @@ index 1663111c..25de3e25 100644
  fn daemon_owns_tool_observation(result: &serde_json::Value) -> bool {
      result
          .get("tool_observation_owner")
-@@ -1300,7 +1317,7 @@ async fn handle_proxy_tool_request(
+@@ -1498,7 +1515,7 @@ async fn handle_proxy_tool_request(
              Response::ok(id, initialize_result())
          }
  
@@ -80,11 +110,197 @@ index 1663111c..25de3e25 100644
  
          "tools/call" => match req.tool_call() {
              Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs b/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs
+index e08b71808..1d925df5b 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs
+@@ -68,6 +68,35 @@ fn tab_name_matches_title(node: &AXNode, title: &str) -> bool {
+ /// How long the omnibox may take to apply queued setup keystrokes.
+ const TYPED_URL_SETTLE_TIMEOUT: Duration = Duration::from_millis(1500);
+ 
++fn ax_only_mode() -> bool {
++    std::env::var_os("CUA_DRIVER_AX_ONLY").is_some()
++}
++
++fn with_ax_only_foreground_guard<T>(
++    ax_only: bool,
++    on_attempt: impl FnOnce(),
++    action: impl FnOnce() -> anyhow::Result<T>,
++) -> anyhow::Result<T> {
++    if ax_only {
++        anyhow::bail!(
++            "CUA_DRIVER_AX_ONLY: refusing browser setup fallback that activates the window or injects global input"
++        );
++    }
++    on_attempt();
++    action()
++}
++
++fn with_setup_foreground_assist(
++    pid: i32,
++    window_id: u32,
++    on_attempt: impl FnOnce(),
++    body: impl FnOnce() -> anyhow::Result<()>,
++) -> anyhow::Result<bool> {
++    with_ax_only_foreground_guard(ax_only_mode(), on_attempt, || {
++        crate::input::skylight::with_foreground_assist(pid, window_id, body)
++    })
++}
++
+ /// Poll `read` until it returns exactly `expected` (trimmed, ASCII
+ /// case-insensitive) or `timeout` elapses. On timeout, returns the last value
+ /// observed so the refusal can say how far the field got.
+@@ -1050,9 +1079,12 @@ fn press_pixel_checkbox(
+     if background {
+         return click(crate::input::mouse::WindowClickDelivery::Background).map(|()| false);
+     }
+-    crate::input::skylight::with_foreground_assist(pid, window_id, || {
+-        click(crate::input::mouse::WindowClickDelivery::Foreground)
+-    })
++    with_setup_foreground_assist(
++        pid,
++        window_id,
++        || {},
++        || click(crate::input::mouse::WindowClickDelivery::Foreground),
++    )
+ }
+ 
+ /// Toggle the setup checkbox with the keyboard: give the exact AX checkbox
+@@ -1172,11 +1204,13 @@ impl SetupUiHandle {
+                                 let Some((x, y)) = center else {
+                                     return false;
+                                 };
+-                                self.foregrounded_window = true;
+-                                self.injected_global_input = true;
+-                                let restored = crate::input::skylight::with_foreground_assist(
++                                let restored = with_setup_foreground_assist(
+                                     pid,
+                                     window_id,
++                                    || {
++                                        self.foregrounded_window = true;
++                                        self.injected_global_input = true;
++                                    },
+                                     || {
+                                         std::thread::sleep(Duration::from_millis(60));
+                                         if crate::apps::frontmost_pid() != Some(pid) {
+@@ -1234,7 +1268,11 @@ impl SetupUiHandle {
+                             } else {
+                                 trusted_fallback_attempted = true;
+                                 release_actionable_nodes(&tree.nodes);
+-                                self.injected_global_input = true;
++                                let foreground_path = !super::platform::guarded_attach_active();
++                                if foreground_path && ax_only_mode() {
++                                    return false;
++                                }
++                                self.injected_global_input |= foreground_path;
+                                 match press_pixel_checkbox(
+                                     pid,
+                                     window_id,
+@@ -1661,11 +1699,13 @@ fn set_remote_debugging(
+                         }
+                     }
+                     Ok(None) => {
+-                        handle.foregrounded_window = true;
+-                        handle.injected_global_input = true;
+-                        let navigated = crate::input::skylight::with_foreground_assist(
++                        let navigated = with_setup_foreground_assist(
+                             pid,
+                             window_id,
++                            || {
++                                handle.foregrounded_window = true;
++                                handle.injected_global_input = true;
++                            },
+                             || {
+                                 std::thread::sleep(Duration::from_millis(60));
+                                 if crate::apps::frontmost_pid() != Some(pid) {
+@@ -1843,11 +1883,13 @@ fn set_remote_debugging(
+                                     ),
+                                 ));
+                             };
+-                            handle.foregrounded_window = true;
+-                            handle.injected_global_input = true;
+-                            let clicked = crate::input::skylight::with_foreground_assist(
++                            let clicked = with_setup_foreground_assist(
+                                 pid,
+                                 window_id,
++                                || {
++                                    handle.foregrounded_window = true;
++                                    handle.injected_global_input = true;
++                                },
+                                 || {
+                                     std::thread::sleep(Duration::from_millis(60));
+                                     if crate::apps::frontmost_pid() != Some(pid) {
+@@ -1942,7 +1984,18 @@ fn set_remote_debugging(
+                     handle.pixel_checkbox.get_or_insert(checkbox);
+                     handle.used_bounded_pixel_fallback = true;
+                     release_actionable_nodes(&tree.nodes);
+-                    handle.injected_global_input = true;
++                    let foreground_path = !super::platform::guarded_attach_active();
++                    if foreground_path && ax_only_mode() {
++                        return Err(handle.abort(
++                            pid,
++                            window_id,
++                            BrowserRefusal::new(
++                                BrowserRefusalCode::BrowserRouteUnavailable,
++                                "CUA_DRIVER_AX_ONLY refuses browser setup that needs foreground input",
++                            ),
++                        ));
++                    }
++                    handle.injected_global_input |= foreground_path;
+                     match press_pixel_checkbox(
+                         pid,
+                         window_id,
+@@ -2017,6 +2070,45 @@ mod tests {
+     use super::*;
+     use cua_driver_core::browser::{existing_profile_setup_descriptor, BrowserProduct};
+ 
++    #[test]
++    fn ax_only_foreground_guard_refuses_before_marking_or_running_fallback() {
++        let attempted = std::cell::Cell::new(false);
++        let ran = std::cell::Cell::new(false);
++
++        let error = with_ax_only_foreground_guard(
++            true,
++            || attempted.set(true),
++            || {
++                ran.set(true);
++                Ok(())
++            },
++        )
++        .unwrap_err();
++
++        assert!(error.to_string().contains("CUA_DRIVER_AX_ONLY"));
++        assert!(!attempted.get());
++        assert!(!ran.get());
++    }
++
++    #[test]
++    fn non_ax_only_foreground_guard_runs_the_requested_fallback() {
++        let attempted = std::cell::Cell::new(false);
++        let ran = std::cell::Cell::new(false);
++
++        with_ax_only_foreground_guard(
++            false,
++            || attempted.set(true),
++            || {
++                ran.set(true);
++                Ok(())
++            },
++        )
++        .unwrap();
++
++        assert!(attempted.get());
++        assert!(ran.get());
++    }
++
+     fn chrome() -> &'static BrowserSetupDescriptor {
+         existing_profile_setup_descriptor(BrowserProduct::GoogleChrome).unwrap()
+     }
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/input/ax_actions.rs b/libs/cua-driver/rust/crates/platform-macos/src/input/ax_actions.rs
-index e086e51e..068397b5 100644
+index 097871afa..9f4a72b4c 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/input/ax_actions.rs
 +++ b/libs/cua-driver/rust/crates/platform-macos/src/input/ax_actions.rs
-@@ -221,6 +221,48 @@ pub fn perform_ax_action(element_ptr: usize, action: &str) -> anyhow::Result<()>
+@@ -224,6 +224,48 @@ pub fn perform_ax_action(element_ptr: usize, action: &str) -> anyhow::Result<()>
      }
  }
  
@@ -134,10 +350,10 @@ index e086e51e..068397b5 100644
  /// names (`press`, `show_menu`, ...) and the tree's spelling (`showalternateui`,
  /// `AXShowAlternateUI`). An unknown name is an error: falling back to AXPress
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
-index e796bab5..81389595 100644
+index 6be1c987b..711bfcec3 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
 +++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
-@@ -26,9 +26,9 @@ use std::sync::Arc;
+@@ -29,9 +29,9 @@ use std::sync::Arc;
  
  use crate::apps;
  use crate::ax::bindings::{
@@ -150,7 +366,7 @@ index e796bab5..81389595 100644
  };
  use crate::focus_guard;
  use crate::window_change_detector::WindowChangeDetector;
-@@ -407,6 +407,25 @@ impl ClickTool {
+@@ -410,6 +410,25 @@ impl ClickTool {
          let has_window_id = args.get("window_id").map(|v| !v.is_null()).unwrap_or(false);
          let has_xy = args.get("x").map(|v| v.is_number()).unwrap_or(false)
              && args.get("y").map(|v| v.is_number()).unwrap_or(false);
@@ -176,7 +392,7 @@ index e796bab5..81389595 100644
          let capture_id = args.opt_str("capture_id");
          if capture_id.is_some() && !has_xy {
              return ToolResult::error("click.capture_id requires pixel coordinates x and y.")
-@@ -801,6 +820,9 @@ impl ClickTool {
+@@ -804,6 +823,9 @@ impl ClickTool {
              // above. In background, drop the fallback rather than silently
              // escalate when the pointer rung would refuse (e.g. a
              // minimized/hidden target); the semantic path still runs.
@@ -186,7 +402,7 @@ index e796bab5..81389595 100644
              if selection_pixel.is_some()
                  && !delivery_mode.is_foreground()
                  && _mutation_lease
-@@ -1621,6 +1643,66 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
+@@ -1624,6 +1646,66 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
      roles
  }
  
@@ -253,108 +469,11 @@ index e796bab5..81389595 100644
  fn perform_ax_click(
      element: (usize, usize),
      window: (i32, u32),
-diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/focus.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/focus.rs
-new file mode 100644
-index 00000000..e91282dd
---- /dev/null
-+++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/focus.rs
-@@ -0,0 +1,91 @@
-+use async_trait::async_trait;
-+use cua_driver_core::{
-+    protocol::ToolResult,
-+    tool::{Tool, ToolDef},
-+};
-+use serde_json::Value;
-+use std::sync::Arc;
-+
-+use super::ToolState;
-+
-+pub struct FocusTool {
-+    state: Arc<ToolState>,
-+}
-+
-+impl FocusTool {
-+    pub fn new(state: Arc<ToolState>) -> Self {
-+        Self { state }
-+    }
-+}
-+
-+static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
-+
-+fn def() -> &'static ToolDef {
-+    DEF.get_or_init(|| ToolDef {
-+        name: "focus".into(),
-+        description: "Set AXFocused=true on an element_token without pressing it. Pure AX: no keys, no cursor, no activation. Useful before paste (clipboard + Cmd+V) or typing into a field that does not accept AXPress."
-+            .into(),
-+        input_schema: serde_json::json!({
-+            "type": "object",
-+            "required": ["element_token"],
-+            "properties": {
-+                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it." },
-+                "element_token": cua_driver_core::tool_schema::element_token_schema(),
-+                "pid": { "type": "integer", "description": "Target process ID. Optional with element_token (the token carries the pid)." },
-+                "window_id": { "type": "integer", "description": "CGWindowID. Optional with element_token." }
-+            }
-+        }),
-+        read_only: false,
-+        destructive: false,
-+        idempotent: true,
-+        open_world: false,
-+    })
-+}
-+
-+#[async_trait]
-+impl Tool for FocusTool {
-+    fn def(&self) -> &ToolDef {
-+        def()
-+    }
-+
-+    async fn invoke(&self, args: Value) -> ToolResult {
-+        use cua_driver_core::tool_args::ArgsExt;
-+
-+        let pid = match super::target_pid(&self.state, &args) {
-+            Ok(v) => v,
-+            Err(e) => return e,
-+        };
-+        let window_id_arg = args.opt_u64("window_id");
-+        let resolved = match self.state.snapshots.resolve(pid, &args) {
-+            Ok(r) => r,
-+            Err(e) => return e,
-+        };
-+        let (_, _, element_guard) = resolved.into_parts(window_id_arg);
-+        let Some(guard) = element_guard else {
-+            return ToolResult::error("focus requires an element_token");
-+        };
-+        let ptr = guard.as_ptr();
-+
-+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
-+            loop {
-+                crate::input::ax_actions::focus_element(ptr)?;
-+                if crate::input::ax_actions::is_element_focused(pid, ptr) {
-+                    return Ok(());
-+                }
-+                if std::time::Instant::now() >= deadline {
-+                    anyhow::bail!("requested element did not become focused");
-+                }
-+                std::thread::sleep(std::time::Duration::from_millis(20));
-+            }
-+        })
-+        .await;
-+
-+        match result {
-+            Ok(Ok(())) => ToolResult::text("Focused element via AX.")
-+                .with_structured(serde_json::json!({ "path": "ax", "effect": "confirmed" })),
-+            Ok(Err(e)) => ToolResult::error(format!("focus failed: {e}")),
-+            Err(e) => ToolResult::error(format!("focus task failed: {e}")),
-+        }
-+    }
-+}
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/hotkey.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/hotkey.rs
-index 2bf28e05..4e6510db 100644
+index ea43ddfed..29de92485 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/hotkey.rs
 +++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/hotkey.rs
-@@ -221,6 +221,11 @@ impl Tool for HotkeyTool {
+@@ -226,6 +226,11 @@ impl Tool for HotkeyTool {
              Ok(v) => v,
              Err(e) => return e,
          };
@@ -366,217 +485,11 @@ index 2bf28e05..4e6510db 100644
  
          if args.get("keys").and_then(|v| v.as_array()).is_none() {
              return ToolResult::error("Missing required parameter: keys");
-diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
-index bc6a36c0..e812a506 100644
---- a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
-+++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
-@@ -6,6 +6,7 @@ mod click;
- mod clipboard;
- mod double_click;
- mod drag;
-+mod focus;
- mod get_window_state;
- mod hotkey;
- mod invoke_menu;
-@@ -14,6 +15,7 @@ mod launch_app;
- mod list_apps;
- mod list_windows;
- mod menu_equivalent;
-+mod paste;
- mod press_key;
- mod right_click;
- mod scroll;
-@@ -1127,6 +1129,10 @@ pub fn register_all(
-         right_click::RightClickTool::new(state.clone()),
-         &pid_window_candidates,
-     ));
-+    registry.register(pid_window_guarded(
-+        focus::FocusTool::new(state.clone()),
-+        &pid_window_candidates,
-+    ));
-     registry.register(pid_window_guarded(
-         drag::DragTool::new(state.clone()),
-         &pid_window_candidates,
-@@ -1151,10 +1157,13 @@ pub fn register_all(
-         scroll::ScrollTool::new(state.clone()),
-         &pid_window_candidates,
-     ));
--    cua_driver_core::clipboard::register_clipboard_tools(
--        registry,
--        Arc::new(clipboard::MacosClipboard::new()),
--    );
-+    let clipboard_backend: Arc<dyn cua_driver_core::clipboard::ClipboardBackend> =
-+        Arc::new(clipboard::MacosClipboard::new());
-+    cua_driver_core::clipboard::register_clipboard_tools(registry, clipboard_backend.clone());
-+    registry.register(Box::new(paste::PasteTool::new(
-+        state.clone(),
-+        clipboard_backend,
-+    )));
-     // The standalone `screenshot` tool was removed (#1692). The pixel-grounding
-     // screenshot the Claude Code computer-use compat loop relies on now comes
-     // from `get_window_state` (which always returns BOTH the tree AND a
-diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/paste.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/paste.rs
-new file mode 100644
-index 00000000..3efde12e
---- /dev/null
-+++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/paste.rs
-@@ -0,0 +1,151 @@
-+use async_trait::async_trait;
-+use cua_driver_core::{
-+    clipboard::ClipboardBackend,
-+    protocol::ToolResult,
-+    tool::{Tool, ToolDef},
-+};
-+use serde_json::Value;
-+use std::sync::Arc;
-+
-+use super::ToolState;
-+
-+pub struct PasteTool {
-+    state: Arc<ToolState>,
-+    clipboard: Arc<dyn ClipboardBackend>,
-+}
-+
-+impl PasteTool {
-+    pub fn new(state: Arc<ToolState>, clipboard: Arc<dyn ClipboardBackend>) -> Self {
-+        Self { state, clipboard }
-+    }
-+}
-+
-+static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
-+
-+fn def() -> &'static ToolDef {
-+    DEF.get_or_init(|| ToolDef {
-+        name: "paste".into(),
-+        description: "Paste into an app like Codex: save the clipboard, activate the target window, optionally focus element_token, send Cmd+V, then restore the previous frontmost app (and the previous clipboard when it was text). Accepts exactly one of text, file_path, or image_path. Brief focus steal by design (macOS cannot paste into a background app)."
-+            .into(),
-+        input_schema: serde_json::json!({
-+            "type": "object",
-+            "properties": {
-+                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it." },
-+                "text": { "type": "string", "description": "Text to paste." },
-+                "file_path": { "type": "string", "description": "Absolute path to a local file to paste as a file URL." },
-+                "image_path": { "type": "string", "description": "Absolute path to a local image to paste." },
-+                "allow_clipboard_overwrite": { "type": "boolean", "description": "Required when the current clipboard holds non-text content: without it, paste refuses rather than destroying it." },
-+                "pid": { "type": "integer", "description": "Target process ID." },
-+                "window_id": { "type": "integer", "description": "Optional target window." },
-+                "element_token": cua_driver_core::tool_schema::element_token_schema()
-+            }
-+        }),
-+        read_only: false,
-+        destructive: false,
-+        idempotent: false,
-+        open_world: false,
-+    })
-+}
-+
-+#[async_trait]
-+impl Tool for PasteTool {
-+    fn def(&self) -> &ToolDef {
-+        def()
-+    }
-+
-+    async fn invoke(&self, args: Value) -> ToolResult {
-+        use cua_driver_core::tool_args::ArgsExt;
-+
-+        let text = args.opt_str("text");
-+        let file_path = args.opt_str("file_path");
-+        let image_path = args.opt_str("image_path");
-+        let provided = [text.is_some(), file_path.is_some(), image_path.is_some()]
-+            .into_iter()
-+            .filter(|v| *v)
-+            .count();
-+        if provided != 1 {
-+            return ToolResult::error(
-+                "paste: provide exactly one of text, file_path, or image_path",
-+            );
-+        }
-+        let pid = match super::target_pid(&self.state, &args) {
-+            Ok(v) => v,
-+            Err(e) => return e,
-+        };
-+        let window_id_arg = args.opt_u64("window_id");
-+
-+        let previous_front = crate::apps::frontmost_pid();
-+        let previous_clip = self.clipboard.read_text().ok().flatten();
-+        let has_content = self
-+            .clipboard
-+            .available_formats()
-+            .map(|formats| !formats.is_empty())
-+            .unwrap_or(false);
-+        let allow_overwrite = args
-+            .get("allow_clipboard_overwrite")
-+            .and_then(|v| v.as_bool())
-+            .unwrap_or(false);
-+        if previous_clip.is_none() && has_content && !allow_overwrite {
-+            return ToolResult::error(
-+                "paste: the clipboard holds non-text content that cannot be restored; pass allow_clipboard_overwrite:true to proceed.",
-+            );
-+        }
-+
-+        let write = if let Some(t) = text.clone() {
-+            self.clipboard.write_text(t)
-+        } else if let Some(f) = file_path.as_deref() {
-+            self.clipboard.write_file_url(f)
-+        } else {
-+            self.clipboard
-+                .write_image(image_path.as_deref().unwrap_or_default())
-+        };
-+        if let Err(e) = write {
-+            return ToolResult::error(format!("paste: clipboard write failed: {e}"));
-+        }
-+
-+        let activated = crate::apps::activate_pid(pid);
-+        std::thread::sleep(std::time::Duration::from_millis(120));
-+
-+        let mut focused = false;
-+        if args.opt_str("element_token").is_some() {
-+            match self.state.snapshots.resolve(pid, &args) {
-+                Ok(resolved) => {
-+                    let (_, _, guard) = resolved.into_parts(window_id_arg);
-+                    if let Some(guard) = guard {
-+                        let ptr = guard.as_ptr();
-+                        focused = crate::input::ax_actions::focus_element(ptr).is_ok();
-+                    }
-+                }
-+                Err(_) => {}
-+            }
-+        }
-+        if !focused {
-+            std::thread::sleep(std::time::Duration::from_millis(60));
-+        }
-+
-+        let paste = crate::input::keyboard::hotkey(pid, "v", &["cmd"]);
-+        std::thread::sleep(std::time::Duration::from_millis(180));
-+
-+        if let Some(prev) = previous_clip {
-+            let _ = self.clipboard.write_text(prev);
-+        }
-+        if let Some(prev) = previous_front {
-+            if prev != pid {
-+                let _ = crate::apps::activate_pid(prev);
-+            }
-+        }
-+
-+        match paste {
-+            Ok(()) => ToolResult::text(format!(
-+                "Pasted into pid {pid} (activated={activated}, focused={focused}); clipboard and prior frontmost restored."
-+            ))
-+            .with_structured(serde_json::json!({
-+                "path": "clipboard+cmdv",
-+                "activated": activated,
-+                "focused": focused,
-+                "effect": "unverifiable"
-+            })),
-+            Err(e) => ToolResult::error(format!("paste: Cmd+V failed: {e}")),
-+        }
-+    }
-+}
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs
-index e4d007f0..b22cd2b9 100644
+index a6a0f12a3..16656e0a1 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs
 +++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/press_key.rs
-@@ -286,6 +286,11 @@ impl Tool for PressKeyTool {
+@@ -289,6 +289,11 @@ impl Tool for PressKeyTool {
              Ok(v) => v,
              Err(e) => return e,
          };
@@ -589,10 +502,10 @@ index e4d007f0..b22cd2b9 100644
              Ok(v) => v,
              Err(e) => return e,
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
-index aa7a814d..513233c5 100644
+index 8f04f67ef..7e76b79a7 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
 +++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
-@@ -232,6 +232,36 @@ impl Tool for ScrollTool {
+@@ -235,6 +235,36 @@ impl Tool for ScrollTool {
                          }
                      }
                  }
@@ -629,7 +542,7 @@ index aa7a814d..513233c5 100644
                  let direction_for_ax = direction.clone();
                  let by_for_ax = by.clone();
                  let foreground = delivery_mode.is_foreground();
-@@ -293,6 +323,12 @@ impl Tool for ScrollTool {
+@@ -296,6 +326,12 @@ impl Tool for ScrollTool {
              }
          }
  
@@ -643,10 +556,10 @@ index aa7a814d..513233c5 100644
          // A target — element (preferred) OR window-local x,y — routes the scroll
          // through a synthesized mouse-wheel event at that screen point, so the
 diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
-index acbc73b0..820fe171 100644
+index 9035b98b3..3e293be41 100644
 --- a/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
 +++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
-@@ -624,6 +624,15 @@ fn synthesis_preflight(
+@@ -627,6 +627,15 @@ fn synthesis_preflight(
      if route == TextDeliveryRoute::AtomicAx {
          return None;
      }
@@ -662,3 +575,6 @@ index acbc73b0..820fe171 100644
      let per_character_ms = match route {
          TextDeliveryRoute::AtomicAx => unreachable!(),
          // PID-routed and desktop Unicode paths post one key-down and one
+-- 
+2.56.0
+

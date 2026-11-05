@@ -1,9 +1,9 @@
 # Cua AX-only — paquete instalable (macOS arm64)
 
-Fork de [Cua Driver](https://github.com/trycua/cua) 0.38 (MIT) convertido en motor
-**AX-only**: lee, clickea, escribe, hace scroll por accesibilidad y navega por CDP.
-**No mueve el mouse, no roba foco y no compite con el teclado del usuario.**
-Cuando una acción no puede hacerse por AX, **falla** (no cae a CGEvent).
+Fork de [Cua Driver](https://github.com/trycua/cua) 0.38 (MIT) con política de
+fondo: lee, clickea, escribe y hace scroll por accesibilidad; navega por CDP.
+No trae ventanas al frente ni reintenta acciones en foreground. Las acciones que
+no tengan una ruta de fondo autorizada fallan cerradas.
 
 ## Contenido
 
@@ -15,8 +15,8 @@ policy/ax-only.yaml   política server-side (default-deny)
 patches/              parches fuente AX-only + cierre por inactividad
 scripts/install.sh    instalador
 scripts/update.sh     rebuild desde upstream + parches + deploy + smoke
-tests/                smoke (48 tools, denegaciones, click AX)
-skills/               skills para agentes (cua-ax-only, 1password)
+tests/                smoke (inventario, denegaciones y click AX)
+skills/               integración de 1Password; Cua usa la skill unificada del repo Sintelia
 examples/             snippets de MCP por host
 ```
 
@@ -38,17 +38,29 @@ Luego:
 2. Reiniciar la app/host.
 3. Cablear el MCP (ver `examples/`): `command` al binario, `args ["mcp","--direct"]`,
    env `CUA_DRIVER_AX_ONLY=1` y `CUA_DRIVER_POLICY_FILE=<ruta>`.
-4. Verificar: `tests/smoke.sh` (48 tools, `run_script`/`drag` ocultas, `press_key` política, click AX).
+4. Para comprobar la política sin tocar ventanas: `tests/probe_tools.py`. El
+   `tests/smoke.sh` completo también hace click en una fila de Finder en segundo
+   plano; ejecútalo solo cuando una prueba de UI esté autorizada y no haya otra
+   sesión controlando el escritorio.
 
 ## Qué permite / qué no
 
-- **Permite:** `click`, `type_text`, `set_value`, `right_click` (token+background);
-  `press_key`/`hotkey` (pid+window+background, rechaza si es frontmost);
-  `scroll` (AXScroll* o fallo); `invoke_menu`; `set_window_frame`; `move_cursor`
-  (overlay); `run_steps` (cada paso con política); lectura y `browser_*`.
-- **Deniega:** `run_script` (se salta la política), `drag`, `double_click`,
-  `bring_to_front`, `clipboard_*`, `kill_app`, `set_config`, `page`, `install_*`,
-  `start_recording`, `escalate_session`, `replay_trajectory`.
+- **Permite:** acciones por `element_token` y rutas `background`; `press_key` y
+  `hotkey` solo con `pid`, `window_id`, `scope:"window"` y `background` (rechaza
+  si el proceso objetivo está al frente); `scroll` por `AXScroll*` o fallo;
+  `drag`/`double_click` únicamente en background cuando la política lo admite;
+  `run_steps` con `delivery_mode:"background"` y `foreground_fallback:false`;
+  lectura y herramientas tipadas `browser_*`.
+- **Apps:** la política no tiene una allowlist por nombre de app. Cualquier app
+  que el host pueda identificar sigue siendo seleccionable; las reglas limitan
+  la ruta de interacción y el destino, no los nombres de apps. `browser_prepare`
+  acepta solo `delivery_mode:"background"`.
+- **Deniega:** `bring_to_front`, `run_script`, entrega `foreground`, fallback foreground, `clipboard_read`,
+  `kill_app`, `set_config`, `page`, `install_*`, `start_recording`,
+  `escalate_session` y `replay_trajectory`. Escribir en el clipboard sigue siendo
+  un cambio global y solo se usa cuando la tarea lo pide. El catálogo actual no
+  publica tools llamadas `focus`, `paste` o `invoke_menu`; el allowlist falla cerrado
+  para nombres ausentes.
 - **Límites:** drag/hover/canvas nativos requieren input físico (solo VM);
   screenshots requieren Screen Recording; `--direct` ata TCC al host; recompilar
   cambia el cdhash y puede pedir permiso de nuevo.
@@ -101,6 +113,13 @@ MIT. Incluye código de trycua/cua (MIT) y parches propios. Ver `LICENSE`.
 
 `click x,y` solo se permite si la ventana objetivo no tiene AX accionable, no está al frente y el usuario está idle (o si es iPhone Mirroring). Si hay AX, exige `element_token`.
 
-## Paste
+## Foco y portapapeles
 
-Tool `paste`: guarda clipboard, activa la app, enfoca (`element_token`), Cmd+V y restaura clipboard/frontmost. Verificado en TextEdit.
+El foco AX de un control dentro de la app objetivo puede ser necesario para una
+acción en segundo plano; no actives la ventana de nivel superior ni mandes eventos
+al teclado global. No hay una restricción por nombre de app. El catálogo actual
+no publica tools llamadas `focus`, `paste` o `invoke_menu`, así que no las cites
+como rutas disponibles. `clipboard_write`
+reemplaza el portapapeles global: úsalo solo si la tarea pide esa operación y el
+usuario acepta ese efecto; si debe conservarse el valor previo y no hay una ruta
+de restauración comprobada, prefiere escritura AX/CDP o informa el límite.

@@ -130,18 +130,15 @@ fi
 
 echo "4/6 skills"
 mkdir -p "$SKILLS"
-for s in cua-ax-only 1password; do
+for s in 1password; do
   if [ -e "$SKILLS/$s" ]; then
     echo "  skill $s ya existe; no se toca"
   else
     cp -R "$HERE/skills/$s" "$SKILLS/"
   fi
 done
-for d in "$HOME/.claude/skills" "$HOME/.claude-b/skills" "$HOME/.codex/skills" \
-         "$HOME/.config/opencode/skills" "$HOME/.gemini/skills" \
-         "$HOME/.gemini/config/skills" "$HOME/.gemini/antigravity-cli/skills"; do
-  [ -d "$d" ] && ln -sfn "$SKILLS/cua-ax-only" "$d/cua-ax-only"
-done
+echo "  Cua Driver usa la skill unificada cua-driver del repo Sintelia."
+echo "  Tras integrarla en origin/main: sync-skill-links --desde-repo cua-driver"
 
 echo "5/6 permisos (TCC)"
 echo "  Concedé Accesibilidad y Grabación de pantalla a CuaDriverFork.app"
