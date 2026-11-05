@@ -1,8 +1,23 @@
+From 7c4e57156b4fb3d390efb2fe620415745301df4c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jer=C3=B3nimo=20Rey?= <jerotherey@gmail.com>
+Date: Tue, 3 Nov 2026 23:37:38 -0600
+Subject: [PATCH] feat(cua-driver): release idle MCP runtimes
+
+---
+ .../crates/cua-driver-core/src/mcp_wire.rs    |  38 +-
+ .../crates/cua-driver-core/src/protocol.rs    |  28 +-
+ .../rust/crates/cua-driver/src/main.rs        | 134 ++-
+ .../crates/cua-driver/src/mcp_envelope.rs     |  40 +-
+ .../rust/crates/cua-driver/src/proxy.rs       | 948 ++++++++++++++++--
+ .../rust/crates/cua-driver/src/serve.rs       | 291 +++++-
+ .../tests/protocol_proxy_recovery_test.rs     |  55 +-
+ 7 files changed, 1407 insertions(+), 127 deletions(-)
+
 diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs
-index 7b3d30db7..12acbb6d2 100644
+index 93ac335b8..85714afc5 100644
 --- a/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver-core/src/mcp_wire.rs
-@@ -52,6 +52,13 @@ fn valid_request_id(req: &Request) -> bool {
+@@ -55,6 +55,13 @@ fn valid_request_id(req: &Request) -> bool {
  /// Classify an individual request, retaining legacy compatibility for embedders.
  /// Stdio adapters additionally use `ProtocolSession` to reject absent metadata.
  pub fn classify_request(req: &Request) -> Result<ProtocolEra, Response> {
@@ -16,7 +31,7 @@ index 7b3d30db7..12acbb6d2 100644
      let meta = req.params.as_ref().and_then(|params| params.get("_meta"));
      let modern_keys_present = meta.is_some_and(|meta| {
          meta.get(PROTOCOL_VERSION_KEY).is_some() || meta.get(CLIENT_CAPABILITIES_KEY).is_some()
-@@ -62,13 +69,6 @@ pub fn classify_request(req: &Request) -> Result<ProtocolEra, Response> {
+@@ -65,13 +72,6 @@ pub fn classify_request(req: &Request) -> Result<ProtocolEra, Response> {
          }
          return Ok(ProtocolEra::Legacy);
      }
@@ -30,7 +45,7 @@ index 7b3d30db7..12acbb6d2 100644
      if !req.params.as_ref().is_some_and(Value::is_object) {
          return Err(invalid_params(req, "MCP params must be an object"));
      }
-@@ -336,4 +336,28 @@ mod tests {
+@@ -339,4 +339,28 @@ mod tests {
          let response = serde_json::to_value(classify_request(&req).unwrap_err()).unwrap();
          assert_eq!(response["error"]["code"], -32602);
      }
@@ -60,10 +75,11 @@ index 7b3d30db7..12acbb6d2 100644
 +    }
  }
 diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs
-index 63733f895..b7bb50a66 100644
+index 1b59212a3..2cda426d5 100644
 --- a/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver-core/src/protocol.rs
-@@ -1,6 +1,6 @@
+@@ -3,7 +3,7 @@
+ 
  //! MCP JSON-RPC 2.0 protocol types.
  
 -use serde::{Deserialize, Serialize};
@@ -71,7 +87,7 @@ index 63733f895..b7bb50a66 100644
  use serde_json::Value;
  
  // ── Request ──────────────────────────────────────────────────────────────────
-@@ -11,11 +11,19 @@ pub struct Request {
+@@ -14,11 +14,19 @@ pub struct Request {
      #[allow(dead_code)]
      pub jsonrpc: String,
      /// Absent on notifications.
@@ -91,7 +107,7 @@ index 63733f895..b7bb50a66 100644
  impl Request {
      pub fn is_notification(&self) -> bool {
          self.id.is_none()
-@@ -609,6 +617,24 @@ mod agent_instruction_tests {
+@@ -612,6 +620,24 @@ mod agent_instruction_tests {
      }
  }
  
@@ -117,10 +133,10 @@ index 63733f895..b7bb50a66 100644
  mod initialize_metadata_tests {
      use super::*;
 diff --git a/libs/cua-driver/rust/crates/cua-driver/src/main.rs b/libs/cua-driver/rust/crates/cua-driver/src/main.rs
-index a7abdcbc4..27afccaee 100644
+index 245c07927..a529477c6 100644
 --- a/libs/cua-driver/rust/crates/cua-driver/src/main.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver/src/main.rs
-@@ -351,6 +351,10 @@ fn build_driver_without_cursor() -> Arc<cua_driver_sdk::CuaDriver> {
+@@ -355,6 +355,10 @@ fn build_driver_without_cursor() -> Arc<cua_driver_sdk::CuaDriver> {
  /// sessions, while `serve`, MCP, and direct SDK creation still fail closed
  /// before accepting desktop actions.
  fn inspect_tools_without_runtime() -> serde_json::Value {
@@ -131,7 +147,7 @@ index a7abdcbc4..27afccaee 100644
      cua_driver_sdk::CuaDriver::inspect_host_tools(cua_driver_sdk::DriverHostOptions {
          cursor: cursor_overlay::CursorConfig {
              enabled: false,
-@@ -358,7 +362,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
+@@ -362,7 +366,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
          },
          host_owns_permission_ux: false,
          host_bundle_id: None,
@@ -140,7 +156,7 @@ index a7abdcbc4..27afccaee 100644
          prepare_desktop_environment: false,
          register_host_tools: Some(register_host_tools),
          authorization_host: None,
-@@ -377,23 +381,91 @@ fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
+@@ -381,23 +385,91 @@ fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
      // adapter repeats this check before reading stdin as defense in depth.
      cua_driver_core::authorization::validate_startup_authorization()?;
      cua_driver_core::policy::validate_configured_policy()?;
@@ -246,7 +262,7 @@ index a7abdcbc4..27afccaee 100644
  }
  
  fn history_admission_requested(explicit: bool, persisted: bool) -> bool {
-@@ -896,19 +968,9 @@ fn main() {
+@@ -903,19 +975,9 @@ fn main() {
                      }
                  }
                  Err(error) => Err(error),
@@ -269,7 +285,7 @@ index a7abdcbc4..27afccaee 100644
              };
              if let Err(e) = result {
                  eprintln!("cua-driver-rs: {e}");
-@@ -1205,19 +1267,9 @@ fn main() -> anyhow::Result<()> {
+@@ -1214,19 +1276,9 @@ fn main() -> anyhow::Result<()> {
                      run_mcp_direct(claude_code_compat)
                  }
                  Err(error) => Err(error),
@@ -293,10 +309,10 @@ index a7abdcbc4..27afccaee 100644
              if let Err(e) = result {
                  eprintln!("cua-driver-rs: {e}");
 diff --git a/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs b/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs
-index fb9d11b80..2b5bda252 100644
+index ec310b484..75467d9d1 100644
 --- a/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs
-@@ -145,6 +145,20 @@ async fn run_with_service<R, W>(
+@@ -148,6 +148,20 @@ async fn run_with_service<R, W>(
      reader: &mut R,
      writer: W,
  ) -> anyhow::Result<()>
@@ -317,7 +333,7 @@ index fb9d11b80..2b5bda252 100644
  where
      R: AsyncBufRead + Unpin,
      W: AsyncWrite + Unpin + Send + 'static,
-@@ -249,8 +263,31 @@ where
+@@ -252,8 +266,31 @@ where
          let sdk = sdk.clone();
          let session = session.clone();
          let serial = legacy_serial.clone();
@@ -349,7 +365,7 @@ index fb9d11b80..2b5bda252 100644
              let response = if request.method.starts_with(PREFIX) {
                  typed_request(service, request).await
              } else {
-@@ -318,6 +355,7 @@ pub(crate) async fn accept<R, W>(
+@@ -321,6 +358,7 @@ pub(crate) async fn accept<R, W>(
      sdk: Arc<crate::sdk_adapter::SdkAdapter>,
      reader: R,
      mut writer: W,
@@ -357,7 +373,7 @@ index fb9d11b80..2b5bda252 100644
  ) -> anyhow::Result<()>
  where
      R: AsyncBufRead + Unpin,
-@@ -335,7 +373,7 @@ where
+@@ -338,7 +376,7 @@ where
          .await?;
      writer.flush().await?;
      anyhow::ensure!(enabled, "MCP envelope stream is disabled");
@@ -367,10 +383,10 @@ index fb9d11b80..2b5bda252 100644
  
  pub(crate) async fn proxy(socket_path: &str) -> anyhow::Result<()> {
 diff --git a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs b/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
-index 02b4498be..1ff6d791e 100644
+index d1385f1f1..e4f8c8409 100644
 --- a/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver/src/proxy.rs
-@@ -16,6 +16,7 @@
+@@ -19,6 +19,7 @@
  //!   Putting the proxy here avoids `mcp-server → cua-driver` reverse
  //!   coupling.
  
@@ -378,7 +394,7 @@ index 02b4498be..1ff6d791e 100644
  use std::sync::Arc;
  
  use cua_driver_core::mcp_wire::{self, ProtocolSession};
-@@ -32,20 +33,36 @@ use crate::serve::{
+@@ -35,20 +36,36 @@ use crate::serve::{
      is_daemon_listening, send_request, DaemonRequest, DaemonResponse, ToolObservationOrigin,
  };
  
@@ -421,7 +437,7 @@ index 02b4498be..1ff6d791e 100644
          let result = crate::mcp_envelope::run(
              sdk.clone(),
              BufReader::new(tokio::io::stdin()),
-@@ -55,33 +72,72 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
+@@ -58,33 +75,72 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
          sdk.shutdown().await.map_err(anyhow::Error::msg)?;
          return result;
      }
@@ -513,7 +529,7 @@ index 02b4498be..1ff6d791e 100644
          let trimmed = line.trim();
          if trimmed.is_empty() {
              continue;
-@@ -93,62 +149,90 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
+@@ -96,62 +152,90 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
              }
              Ok(request) if request.is_notification() => continue,
              Ok(mut request) => {
@@ -643,7 +659,7 @@ index 02b4498be..1ff6d791e 100644
              }
          };
          let serialized = serde_json::to_string(&response).unwrap_or_else(|error| {
-@@ -161,7 +245,554 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
+@@ -164,7 +248,554 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
          writer.flush().await?;
      }
  
@@ -1199,7 +1215,7 @@ index 02b4498be..1ff6d791e 100644
  }
  
  pub(crate) fn apply_direct_session_identity(request: &mut Request, transport_session: &str) {
-@@ -1019,6 +1650,193 @@ fn daemon_response_to_tool_result(
+@@ -1022,6 +1653,193 @@ fn daemon_response_to_tool_result(
  mod tests {
      use super::*;
  
@@ -1394,10 +1410,10 @@ index 02b4498be..1ff6d791e 100644
      async fn modern_proxy_metadata_and_rejections_need_no_daemon_call() {
          use serde_json::json;
 diff --git a/libs/cua-driver/rust/crates/cua-driver/src/serve.rs b/libs/cua-driver/rust/crates/cua-driver/src/serve.rs
-index 518df3518..1e855fd94 100644
+index 92129f3d9..6f0f0a799 100644
 --- a/libs/cua-driver/rust/crates/cua-driver/src/serve.rs
 +++ b/libs/cua-driver/rust/crates/cua-driver/src/serve.rs
-@@ -22,7 +22,7 @@
+@@ -25,7 +25,7 @@
  //! namespace on every platform.
  
  use std::collections::{HashMap, HashSet};
@@ -1406,7 +1422,7 @@ index 518df3518..1e855fd94 100644
  
  pub use cua_driver_core::daemon::{
      is_daemon_listening, send_request, socket_path_for_namespace, DaemonRequest, DaemonResponse,
-@@ -89,6 +89,65 @@ fn reap_finished_connections(connection_tasks: &mut tokio::task::JoinSet<()>) {
+@@ -92,6 +92,65 @@ fn reap_finished_connections(connection_tasks: &mut tokio::task::JoinSet<()>) {
      }
  }
  
@@ -1472,7 +1488,7 @@ index 518df3518..1e855fd94 100644
  async fn take_trusted_resume_record(
      registry: &TrustedResumeRegistry,
      credential: &str,
-@@ -609,6 +668,46 @@ fn prepare_embedded_socket_path(socket_path: &str, embedded: bool) -> anyhow::Re
+@@ -612,6 +671,46 @@ fn prepare_embedded_socket_path(socket_path: &str, embedded: bool) -> anyhow::Re
  static PERMISSION_GATE_PENDING: std::sync::atomic::AtomicBool =
      std::sync::atomic::AtomicBool::new(false);
  
@@ -1519,7 +1535,7 @@ index 518df3518..1e855fd94 100644
  // Only the macOS first-launch gate sets it; elsewhere it stays false.
  #[cfg(target_os = "macos")]
  /// Mark whether the macOS first-launch gate is still waiting for TCC grants.
-@@ -942,6 +1041,22 @@ pub async fn run_serve(
+@@ -945,6 +1044,22 @@ pub async fn run_serve(
      }
  
      let embedded = cua_driver_core::embedded_mode();
@@ -1542,7 +1558,7 @@ index 518df3518..1e855fd94 100644
      // Embedded endpoints are host-owned. The daemon must never unlink an
      // arbitrary pre-existing path between the host's safety check and bind.
      prepare_embedded_socket_path(socket_path, embedded)?;
-@@ -978,15 +1093,26 @@ pub async fn run_serve(
+@@ -981,15 +1096,26 @@ pub async fn run_serve(
  
      // Idle-session and recording maintenance is owned by the SDK runtime so
      // direct embedded applications and daemon-backed clients behave alike.
@@ -1571,7 +1587,7 @@ index 518df3518..1e855fd94 100644
      loop {
          tokio::select! {
              result = listener.accept() => {
-@@ -1002,6 +1128,7 @@ pub async fn run_serve(
+@@ -1005,6 +1131,7 @@ pub async fn run_serve(
                  let reg = sdk.clone();
                  let shutdown_tx2 = shutdown_tx.clone();
                  let trusted_resume_registry = trusted_resume_registry.clone();
@@ -1579,7 +1595,7 @@ index 518df3518..1e855fd94 100644
  
                  connection_tasks.spawn(async move {
                      let (reader, mut writer) = stream.into_split();
-@@ -1039,7 +1166,12 @@ pub async fn run_serve(
+@@ -1042,7 +1169,12 @@ pub async fn run_serve(
                              "mcp_envelope_stream" if control_session_id.is_none() && trusted_session.is_none() => {
                                  // Existing local-peer authentication already passed.
                                  // Registry and session lifetime belong to this stream.
@@ -1593,7 +1609,7 @@ index 518df3518..1e855fd94 100644
                                  return;
                              }
                              "metadata" => {
-@@ -1157,6 +1289,16 @@ pub async fn run_serve(
+@@ -1160,6 +1292,16 @@ pub async fn run_serve(
                                  ).await;
                              }
                              "call" => {
@@ -1610,7 +1626,7 @@ index 518df3518..1e855fd94 100644
                                  let resp = invoke_daemon_tool(&reg, req).await;
                                  let _ = writer.write_all(
                                      (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
-@@ -1249,6 +1391,16 @@ pub async fn run_serve(
+@@ -1252,6 +1394,16 @@ pub async fn run_serve(
                                  ).await;
                              }
                              "trusted_session_call" => {
@@ -1627,7 +1643,7 @@ index 518df3518..1e855fd94 100644
                                  let resp = match trusted_session.as_ref() {
                                      Some(connection) => {
                                          let name = req.name.unwrap_or_default();
-@@ -1371,6 +1523,21 @@ pub async fn run_serve(
+@@ -1374,6 +1526,21 @@ pub async fn run_serve(
                      }
                  });
              }
@@ -1649,7 +1665,7 @@ index 518df3518..1e855fd94 100644
              _ = &mut shutdown_rx => {
                  eprintln!("Cua Driver daemon shutting down.");
                  break;
-@@ -1847,7 +2014,12 @@ pub async fn run_serve(
+@@ -1850,7 +2017,12 @@ pub async fn run_serve(
                          match req.method.as_str() {
                              "mcp_envelope_stream" if control_session_id.is_none() && trusted_session.is_none() => {
                                  // Same transport-owned receiver as the Unix branch.
@@ -1663,7 +1679,7 @@ index 518df3518..1e855fd94 100644
                                  return;
                              }
                              "metadata" => {
-@@ -2572,6 +2744,115 @@ mod socket_tests {
+@@ -2575,6 +2747,115 @@ mod socket_tests {
      }
  }
  
@@ -1884,3 +1900,6 @@ index ac146644d..97635293b 100644
      fresh.call("start_session", json!({"session":"fresh-client"}));
      fresh.call("get_session_state", json!({"session":"fresh-client"}));
      survivor.call("get_config", json!({"session":"survivor"}));
+-- 
+2.56.0
+
